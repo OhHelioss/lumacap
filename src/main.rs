@@ -28,7 +28,7 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::*;
-use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_ABOVE_NORMAL};
 use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows::Win32::System::Diagnostics::Debug::{Beep, SetUnhandledExceptionFilter, EXCEPTION_POINTERS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -558,9 +558,10 @@ fn post_frame_msg() {
 unsafe fn open_video(act: &IMFActivate, want_fps: u32) -> R<(IMFSourceReader, VideoFmt, bool)> {
     let source: IMFMediaSource = act.ActivateObject()?;
     let mut attrs: Option<IMFAttributes> = None;
-    MFCreateAttributes(&mut attrs, 2)?;
+    MFCreateAttributes(&mut attrs, 3)?;
     let attrs = attrs.unwrap();
     attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
+    let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
     let reader = MFCreateSourceReaderFromMediaSource(&source, &attrs)?;
     let vs = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
@@ -1113,6 +1114,15 @@ fn video_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>) {
             };
             sh.frames.fetch_add(1, Ordering::Relaxed);
 
+            // hand the newest frame to the preview thread (latest wins)
+            let want_shot = sh.shot_req.swap(false, Ordering::SeqCst);
+            {
+                let mut slot = sh.pv_slot.lock().unwrap();
+                let keep = want_shot || slot.as_ref().map(|x| x.1).unwrap_or(false);
+                *slot = Some((Sendable(sample.clone()), keep));
+            }
+            sh.pv_cv.notify_one();
+
             replay_tick(&sh);
             let rec = sh.rec.lock().unwrap().clone();
             let rp = sh.replay.lock().unwrap().as_ref().and_then(|r| r.cur.clone());
@@ -1127,14 +1137,6 @@ fn video_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>) {
                 (None, None) => {}
             }
 
-            // hand the newest frame to the preview thread (latest wins)
-            let want_shot = sh.shot_req.swap(false, Ordering::SeqCst);
-            {
-                let mut slot = sh.pv_slot.lock().unwrap();
-                let keep = want_shot || slot.as_ref().map(|x| x.1).unwrap_or(false);
-                *slot = Some((Sendable(sample), keep));
-            }
-            sh.pv_cv.notify_one();
         }
     }
 }
@@ -1142,6 +1144,7 @@ fn video_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>) {
 fn preview_thread(sh: Arc<Shared>) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     let (w, h) = (sh.fmt.w as usize, sh.fmt.h as usize);
     let mut spare: Vec<u32> = Vec::new();
@@ -3020,6 +3023,136 @@ fn track_light(c: u32) -> COLORREF {
 
 // ---------- paint ----------
 
+/// The last fully painted frame, kept so new video frames can be blitted without repainting the whole UI.
+struct Fast {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    w: i32,
+    h: i32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    prad: i32,
+    full: bool,
+    rec: Option<(u64, bool)>,
+    replay: Option<String>,
+    fps: Option<String>,
+}
+unsafe impl Send for Fast {}
+static FAST: Mutex<Option<Fast>> = Mutex::new(None);
+
+unsafe fn free_fast(f: Fast) {
+    SelectObject(f.dc, f.old);
+    let _ = DeleteObject(f.bmp);
+    let _ = DeleteDC(f.dc);
+}
+
+unsafe fn draw_preview(hdc: HDC, dx: i32, dy: i32, dw: i32, dh: i32, data: &[u32], pvw: i32, pvh: i32) {
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = pvw;
+    bmi.bmiHeader.biHeight = -pvh;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+    // 1:1 needs no filtering; HALFTONE only when the picture really is scaled
+    let near = (dw - pvw).abs() <= pvw / 30 && (dh - pvh).abs() <= pvh / 30;
+    SetStretchBltMode(hdc, if near { COLORONCOLOR } else { HALFTONE });
+    let _ = SetBrushOrgEx(hdc, 0, 0, None);
+    StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, pvw, pvh, Some(data.as_ptr() as *const c_void), &bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
+unsafe fn draw_chips(hdc: HDC, dx: i32, dy: i32, dw: i32, rec: &Option<(u64, bool)>, replay: &Option<String>, fps: &Option<String>) {
+    let white = rgb(236, 238, 242);
+    let red = rgb(240, 68, 76);
+    let c_border = rgb(44, 48, 58);
+    let chip = |hdc: HDC, r: &RECT| round_rect_argb(hdc, r, (r.bottom - r.top) / 2, 0xC8101216, Some((c_border, 1)));
+    let f_bold = font(16, 700, w!("Segoe UI"));
+    let f_small = font(13, 400, w!("Segoe UI"));
+    if let Some((secs, paused)) = rec {
+        SelectObject(hdc, f_bold);
+        let pill = RECT { left: dx + s(16), top: dy + s(16), right: dx + s(176), bottom: dy + s(50) };
+        chip(hdc, &pill);
+        circle(hdc, (pill.left + s(20), (pill.top + pill.bottom) / 2), s(6), if *paused { rgb(240, 190, 40) } else { red }, None);
+        let mut tr = RECT { left: pill.left + s(38), top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
+        text(hdc, &format!("{} {:02}:{:02}", if *paused { "PAUSED" } else { "REC" }, secs / 60, secs % 60), &mut tr, white, DT_LEFT | DT_SINGLELINE);
+    } else if let Some(label) = replay {
+        SelectObject(hdc, f_small);
+        let pill = RECT { left: dx + s(16), top: dy + s(16), right: dx + s(160), bottom: dy + s(46) };
+        chip(hdc, &pill);
+        circle(hdc, (pill.left + s(18), (pill.top + pill.bottom) / 2), s(4), rgb(52, 199, 120), None);
+        let mut tr = RECT { left: pill.left + s(32), top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
+        text(hdc, label, &mut tr, white, DT_LEFT | DT_SINGLELINE);
+    }
+    if let Some(label_t) = fps {
+        SelectObject(hdc, f_small);
+        let wpx = s(40) + label_t.chars().count() as i32 * s(7);
+        let pill = RECT { left: dx + dw - s(16) - wpx, top: dy + s(16), right: dx + dw - s(16), bottom: dy + s(46) };
+        chip(hdc, &pill);
+        let mut tr = RECT { left: pill.left, top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
+        text(hdc, label_t, &mut tr, white, DT_CENTER | DT_SINGLELINE);
+    }
+    SelectObject(hdc, GetStockObject(SYSTEM_FONT));
+    let _ = DeleteObject(f_bold);
+    let _ = DeleteObject(f_small);
+}
+
+/// Push the newest video frame to the screen without repainting the controls. Returns false if a full repaint is needed.
+unsafe fn fast_present(hwnd: HWND) -> bool {
+    let g = FAST.lock().unwrap();
+    let Some(f) = g.as_ref() else { return false };
+    let mut rc = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rc);
+    if rc.right != f.w || rc.bottom != f.h {
+        return false;
+    }
+    let sh = &ui().sh;
+    {
+        let t = sh.toast.lock().unwrap();
+        if t.1.elapsed().as_millis() < 2800 && !t.0.is_empty() {
+            return false;
+        }
+    }
+    let fw = sh.fmt.w as i64;
+    sh.pv_full.store(f.dw as i64 * 10 > fw * 6, Ordering::Relaxed);
+    let hdc = f.dc;
+    let rgn = if f.prad > 0 {
+        let r = CreateRoundRectRgn(f.dx, f.dy, f.dx + f.dw + 1, f.dy + f.dh + 1, f.prad * 2, f.prad * 2);
+        SelectClipRgn(hdc, r);
+        Some(r)
+    } else {
+        None
+    };
+    {
+        let buf = sh.preview.lock().unwrap();
+        if buf.data.is_empty() {
+            if let Some(r) = rgn {
+                SelectClipRgn(hdc, None);
+                let _ = DeleteObject(r);
+            }
+            return false;
+        }
+        draw_preview(hdc, f.dx, f.dy, f.dw, f.dh, &buf.data, buf.w as i32, buf.h as i32);
+    }
+    if let Some(r) = rgn {
+        SelectClipRgn(hdc, None);
+        let _ = DeleteObject(r);
+    }
+    let prev_rect = RECT { left: f.dx, top: f.dy, right: f.dx + f.dw, bottom: f.dy + f.dh };
+    if !f.full {
+        round_rect_argb(hdc, &prev_rect, f.prad, 0x00000000, Some((rgb(44, 48, 58), 1)));
+    }
+    draw_chips(hdc, f.dx, f.dy, f.dw, &f.rec, &f.replay, &f.fps);
+    let wdc = GetDC(hwnd);
+    let (l, t) = ((f.dx - 2).max(0), (f.dy - 2).max(0));
+    let (r, b) = ((f.dx + f.dw + 2).min(f.w), (f.dy + f.dh + 2).min(f.h));
+    let _ = BitBlt(wdc, l, t, r - l, b - t, hdc, l, t, SRCCOPY);
+    ReleaseDC(hwnd, wdc);
+    true
+}
+
 unsafe fn paint(hwnd: HWND) {
     let mut ps = PAINTSTRUCT::default();
     let hdc0 = BeginPaint(hwnd, &mut ps);
@@ -3095,17 +3228,7 @@ unsafe fn paint(hwnd: HWND) {
     if frames > 0 && fps_in > 0 {
         sh.pv_full.store(dw as i64 * 10 > fw * 6, Ordering::Relaxed);
         let buf = sh.preview.lock().unwrap();
-        let (pvw, pvh) = (buf.w as i32, buf.h as i32);
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = pvw;
-        bmi.bmiHeader.biHeight = -pvh;
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-        SetStretchBltMode(hdc, HALFTONE);
-        let _ = SetBrushOrgEx(hdc, 0, 0, None);
-        StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, pvw, pvh, Some(buf.data.as_ptr() as *const c_void), &bmi, DIB_RGB_COLORS, SRCCOPY);
+        draw_preview(hdc, dx, dy, dw, dh, &buf.data, buf.w as i32, buf.h as i32);
     } else {
         let box_r = RECT { left: dx, top: dy, right: dx + dw, bottom: dy + dh };
         fill_rect(hdc, &box_r, rgb(13, 14, 17));
@@ -3127,33 +3250,10 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     // ---- overlays (glass chips) ----
-    {
-        let chip = |hdc: HDC, r: &RECT| round_rect_argb(hdc, r, (r.bottom - r.top) / 2, 0xC8101216, Some((c_border, 1)));
-        if let Some((secs, _, paused)) = &recording {
-            SelectObject(hdc, f_bold);
-            let pill = RECT { left: dx + s(16), top: dy + s(16), right: dx + s(176), bottom: dy + s(50) };
-            chip(hdc, &pill);
-            circle(hdc, (pill.left + s(20), (pill.top + pill.bottom) / 2), s(6), if *paused { rgb(240, 190, 40) } else { red }, None);
-            let mut tr = RECT { left: pill.left + s(38), top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
-            text(hdc, &format!("{} {:02}:{:02}", if *paused { "PAUSED" } else { "REC" }, secs / 60, secs % 60), &mut tr, white, DT_LEFT | DT_SINGLELINE);
-        } else if replay_on {
-            SelectObject(hdc, f_small);
-            let pill = RECT { left: dx + s(16), top: dy + s(16), right: dx + s(160), bottom: dy + s(46) };
-            chip(hdc, &pill);
-            circle(hdc, (pill.left + s(18), (pill.top + pill.bottom) / 2), s(4), rgb(52, 199, 120), None);
-            let mut tr = RECT { left: pill.left + s(32), top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
-            text(hdc, &format!("Replay {}s", cfg.replay_secs), &mut tr, white, DT_LEFT | DT_SINGLELINE);
-        }
-        if frames > 0 && fps_in > 0 {
-            SelectObject(hdc, f_small);
-            let label_t = format!("{}p  ·  {} fps", sh.fmt.h, fps_in);
-            let wpx = s(40) + label_t.chars().count() as i32 * s(7);
-            let pill = RECT { left: dx + dw - s(16) - wpx, top: dy + s(16), right: dx + dw - s(16), bottom: dy + s(46) };
-            chip(hdc, &pill);
-            let mut tr = RECT { left: pill.left, top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
-            text(hdc, &label_t, &mut tr, white, DT_CENTER | DT_SINGLELINE);
-        }
-    }
+    let chip_rec: Option<(u64, bool)> = recording.as_ref().map(|(secs, _, paused)| (*secs as u64, *paused));
+    let chip_replay: Option<String> = if recording.is_none() && replay_on { Some(format!("Replay {}s", cfg.replay_secs)) } else { None };
+    let chip_fps: Option<String> = if frames > 0 && fps_in > 0 { Some(format!("{}p  ·  {} fps", sh.fmt.h, fps_in)) } else { None };
+    draw_chips(hdc, dx, dy, dw, &chip_rec, &chip_replay, &chip_fps);
 
     // ---- bottom bar (floating dock) ----
     if !full {
@@ -3595,13 +3695,26 @@ unsafe fn paint(hwnd: HWND) {
     }
 
     let _ = BitBlt(hdc0, 0, 0, cw, ch, hdc, 0, 0, SRCCOPY);
-    SelectObject(hdc, old_bmp);
     // a font that is still selected cannot be deleted (that leaked one GDI object per repaint)
     SelectObject(hdc, GetStockObject(SYSTEM_FONT));
-    let _ = DeleteObject(bmp);
-    let _ = DeleteDC(hdc);
     for f in [f_small, f_norm, f_bold, f_big, f_icon] {
         let _ = DeleteObject(f);
+    }
+    let overlay_open = PANEL.load(Ordering::Relaxed) || LIB_OPEN.load(Ordering::Relaxed) || TRIM_OPEN.load(Ordering::Relaxed);
+    let toast_on = {
+        let t = sh.toast.lock().unwrap();
+        t.1.elapsed().as_millis() < 2800 && !t.0.is_empty()
+    };
+    let keep = !overlay_open && !toast_on && frames > 0 && fps_in > 0;
+    let newfast = Fast { dc: hdc, bmp, old: old_bmp, w: cw, h: ch, dx, dy, dw, dh, prad, full, rec: chip_rec, replay: chip_replay, fps: chip_fps };
+    let prev_fast = FAST.lock().unwrap().take();
+    if let Some(pf) = prev_fast {
+        free_fast(pf);
+    }
+    if keep {
+        *FAST.lock().unwrap() = Some(newfast);
+    } else {
+        free_fast(newfast);
     }
     let _ = EndPaint(hwnd, &ps);
 }
@@ -3762,8 +3875,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             FRAME_PENDING.store(false, Ordering::Relaxed);
             // While a panel is open the 30 Hz timer does the redraws; frame-driven repaints would starve input.
             let overlay = PANEL.load(Ordering::Relaxed) || LIB_OPEN.load(Ordering::Relaxed) || TRIM_OPEN.load(Ordering::Relaxed);
-            if !overlay && paint_allowed() && !HIDDEN.load(Ordering::Relaxed) {
-                let _ = InvalidateRect(hwnd, None, false);
+            if !overlay && !HIDDEN.load(Ordering::Relaxed) {
+                let fast_ok = !MOVING.load(Ordering::Relaxed) && fast_present(hwnd);
+                if !fast_ok && paint_allowed() {
+                    let _ = InvalidateRect(hwnd, None, false);
+                }
             }
             LRESULT(0)
         }
@@ -3776,7 +3892,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 sh.fps_meas.store(f.wrapping_sub(last), Ordering::Relaxed);
                 maintenance();
             }
-            if paint_allowed() && !HIDDEN.load(Ordering::Relaxed) {
+            // With the fast video path the controls only need ~10 repaints a second unless something is animating.
+            let busy = PANEL.load(Ordering::Relaxed)
+                || LIB_OPEN.load(Ordering::Relaxed)
+                || TRIM_OPEN.load(Ordering::Relaxed)
+                || FAST.lock().unwrap().is_none()
+                || ANIM.lock().unwrap().iter().any(|&a| a != 0);
+            if (busy || t % 3 == 0) && paint_allowed() && !HIDDEN.load(Ordering::Relaxed) {
                 let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
