@@ -16,8 +16,13 @@ A tiny, fast, open-source recorder for capture cards on Windows. One exe, no ins
 - Minimize to tray and start with Windows
 - Light/dark theme and accent colours
 
-## Download / build
-Grab `lumacap.exe` from the Releases page or the latest Actions run, or build it yourself:
+## Download
+
+**[Download the latest `lumacap.exe`](https://github.com/OhHelioss/lumacap/releases/latest)** (no installer, just run it). Windows SmartScreen may warn because the exe is not code-signed: choose *More info → Run anyway*.
+
+## Build it yourself
+
+Or build it yourself:
 
 ```
 git clone https://github.com/OhHelioss/lumacap
