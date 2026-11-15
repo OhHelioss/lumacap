@@ -6,6 +6,10 @@
 //! Hotkeys (global): F8 save replay, F9 record, F10 screenshot. F11 = fullscreen.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod h264;
+mod rtmp;
+mod stream;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, Ordering};
@@ -158,6 +162,11 @@ struct Settings {
     hk_mic: u32,
     video_name: String,
     update_check: bool,
+    stream_server: u32, // 0 Twitch, 1 YouTube, 2 custom
+    stream_custom: String,
+    stream_key: String,
+    stream_kbps: u32,
+    stream_fps30: bool,
 }
 
 fn settings_path() -> String {
@@ -199,6 +208,11 @@ impl Settings {
             hk_mic: 0x7B,
             video_name: String::new(),
             update_check: true,
+            stream_server: 0,
+            stream_custom: String::new(),
+            stream_key: String::new(),
+            stream_kbps: 6000,
+            stream_fps30: false,
         }
     }
 
@@ -240,6 +254,11 @@ impl Settings {
                     "hk_mic" => s.hk_mic = v.parse().unwrap_or(s.hk_mic),
                     "video_name" => s.video_name = v.to_string(),
                     "update_check" => s.update_check = v != "0",
+                    "stream_server" => s.stream_server = v.parse().unwrap_or(0).min(2),
+                    "stream_custom" => s.stream_custom = v.to_string(),
+                    "stream_key" => s.stream_key = v.to_string(),
+                    "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
+                    "stream_fps30" => s.stream_fps30 = v == "1",
                     _ => {}
                 }
             }
@@ -253,7 +272,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -283,7 +302,12 @@ impl Settings {
             self.autostart as u8,
             self.hk_mic,
             self.video_name,
-            self.update_check as u8
+            self.update_check as u8,
+            self.stream_server,
+            self.stream_custom,
+            self.stream_key,
+            self.stream_kbps,
+            self.stream_fps30 as u8
         );
         let _ = std::fs::write(p, txt);
     }
@@ -492,6 +516,7 @@ fn stop_recording() -> bool {
 
 /// Runs about once a second: disk-space guard and automatic file splitting.
 fn maintenance() {
+    stream::check_ended();
     let sh = ui().sh.clone();
     let rec = sh.rec.lock().unwrap().clone();
     let Some(r) = rec else { return };
@@ -925,6 +950,7 @@ struct ReplayBuf {
 }
 
 struct Shared {
+    stream: Mutex<Option<Arc<stream::StreamCtl>>>,
     rec: Mutex<Option<Arc<Recorder>>>,
     replay: Mutex<Option<ReplayBuf>>,
     cfg: Mutex<Settings>,
@@ -1183,6 +1209,7 @@ fn video_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>) {
             }
             sh.pv_cv.notify_one();
 
+            stream::feed_video(&sh, &sample);
             replay_tick(&sh);
             let rec = sh.rec.lock().unwrap().clone();
             let rp = sh.replay.lock().unwrap().as_ref().and_then(|r| r.cur.clone());
@@ -1484,6 +1511,7 @@ fn audio_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>, af: AudioFmt
                     }
                 }
                 let dur = (game.len() / 2) as i64 * 10_000_000 / af.rate as i64;
+                stream::feed_audio(&sh, &mixb);
                 pcm_sample(&mixb, ts, dur).unwrap_or_else(|| sample.clone())
             } else {
                 sample.clone()
@@ -2348,11 +2376,37 @@ enum K {
     Pick,
 }
 
+fn clipboard_text() -> Option<String> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let out = (|| {
+            let h = GetClipboardData(13).ok()?; // CF_UNICODETEXT
+            let hg = windows::Win32::Foundation::HGLOBAL(h.0);
+            let p = GlobalLock(hg) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let mut n = 0usize;
+            while n < 2048 && *p.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        })();
+        let _ = CloseClipboard();
+        out
+    }
+}
+
 fn tab_rows(tab: i32) -> &'static [K] {
     match tab {
         0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick],
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
+        4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle],
         _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
 }
@@ -2559,8 +2613,8 @@ fn controls(rc: &RECT) -> Vec<(i32, RECT)> {
     if PANEL.load(Ordering::Relaxed) {
         let pr = panel_rect(rc);
         v.push((P_CLOSE, sq(pr.right - s(36), pr.top + s(36), s(18))));
-        for t in 0..4 {
-            v.push((P_TAB0 + t, btn(pr.left + s(28) + t * s(116), pr.top + s(66), s(106), s(34))));
+        for t in 0..5 {
+            v.push((P_TAB0 + t, btn(pr.left + s(28) + t * s(98), pr.top + s(66), s(92), s(34))));
         }
         for (i, k) in tab_rows(TAB.load(Ordering::Relaxed)).iter().enumerate() {
             let i = i as i32;
@@ -2730,7 +2784,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
             }
         }
         P_CLOSE => PANEL.store(false, Ordering::Relaxed),
-        t if (P_TAB0..P_TAB0 + 4).contains(&t) => TAB.store(t - P_TAB0, Ordering::Relaxed),
+        t if (P_TAB0..P_TAB0 + 5).contains(&t) => TAB.store(t - P_TAB0, Ordering::Relaxed),
         r if r >= P_ROW0 => {
             let (i, which) = ((r - P_ROW0) / 3, (r - P_ROW0) % 3);
             let tab = TAB.load(Ordering::Relaxed);
@@ -2843,6 +2897,49 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 (3, 7) => {
                     let mut c = sh.cfg.lock().unwrap();
                     c.update_check = !c.update_check;
+                }
+                (4, 0) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.stream_server = if which == 0 { (c.stream_server + 2) % 3 } else { (c.stream_server + 1) % 3 };
+                }
+                (4, 1) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    if c.stream_server == 2 {
+                        match clipboard_text() {
+                            Some(tx) if tx.trim().starts_with("rtmp://") => c.stream_custom = tx.trim().to_string(),
+                            Some(_) => {
+                                drop(c);
+                                set_toast(sh, "Clipboard does not hold an rtmp:// address");
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                (4, 2) => {
+                    match clipboard_text() {
+                        Some(tx) if !tx.trim().is_empty() && tx.trim().len() < 300 && !tx.contains('\n') => {
+                            sh.cfg.lock().unwrap().stream_key = tx.trim().to_string();
+                            set_toast(sh, "Stream key pasted");
+                        }
+                        _ => set_toast(sh, "Copy your stream key first, then click Paste"),
+                    }
+                }
+                (4, 3) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.stream_kbps = step_u32(c.stream_kbps, which, 500, 1000, 12000);
+                }
+                (4, 4) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.stream_fps30 = !c.stream_fps30;
+                }
+                (4, 5) => {
+                    if sh.stream.lock().unwrap().is_some() {
+                        stream::stop_stream();
+                        set_toast(sh, "Stream stopped");
+                    } else {
+                        save_cfg(sh);
+                        stream::go_live();
+                    }
                 }
                 (1, 4) => {
                     let m = !sh.mic_muted.load(Ordering::Relaxed);
@@ -3208,6 +3305,15 @@ unsafe fn draw_chips(hdc: HDC, dx: i32, dy: i32, dw: i32, rec: &Option<(u64, boo
         chip(hdc, &pill);
         let mut tr = RECT { left: pill.left, top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
         text(hdc, label_t, &mut tr, white, DT_CENTER | DT_SINGLELINE);
+    }
+    if let Some(secs) = stream::live_secs() {
+        SelectObject(hdc, f_bold);
+        let top = dy + if rec.is_some() { s(58) } else if replay.is_some() { s(54) } else { s(16) };
+        let pill = RECT { left: dx + s(16), top, right: dx + s(176), bottom: top + s(34) };
+        chip(hdc, &pill);
+        circle(hdc, (pill.left + s(20), (pill.top + pill.bottom) / 2), s(6), rgb(145, 80, 255), None);
+        let mut tr = RECT { left: pill.left + s(38), top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
+        text(hdc, &format!("LIVE {:02}:{:02}", secs / 60, secs % 60), &mut tr, white, DT_LEFT | DT_SINGLELINE);
     }
     SelectObject(hdc, GetStockObject(SYSTEM_FONT));
     let _ = DeleteObject(f_bold);
@@ -3654,7 +3760,7 @@ unsafe fn paint(hwnd: HWND) {
         glyph(hdc, 0xE711, &cb, white);
 
         let tab = TAB.load(Ordering::Relaxed);
-        for (i, name) in ["Video", "Audio", "General", "System"].iter().enumerate() {
+        for (i, name) in ["Video", "Audio", "General", "System", "Stream"].iter().enumerate() {
             let r = rect_of(P_TAB0 + i as i32);
             let sel = tab == i as i32;
             let fill = if sel { accent } else if hover == P_TAB0 + i as i32 { rgb(49, 54, 65) } else { rgb(38, 42, 51) };
@@ -3796,6 +3902,26 @@ unsafe fn paint(hwnd: HWND) {
                 cycle(hdc, 6, "Change");
                 label(hdc, 7, "Screenshots folder", &cfg.shot_dir);
                 cycle(hdc, 7, "Change");
+            }
+            4 => {
+                let live = sh.stream.lock().unwrap().is_some();
+                label(hdc, 0, "Service", "Plain rtmp:// servers only (Twitch, YouTube)");
+                cycle(hdc, 0, match cfg.stream_server { 0 => "Twitch", 1 => "YouTube", _ => "Custom server" });
+                label(hdc, 1, "Server address", &if cfg.stream_server == 2 { if cfg.stream_custom.is_empty() { "Not set. Click Paste with an rtmp:// address copied".to_string() } else { cfg.stream_custom.clone() } } else { stream::server_url(&cfg) });
+                cycle(hdc, 1, if cfg.stream_server == 2 { "Paste" } else { "Preset" });
+                let k = cfg.stream_key.trim();
+                label(hdc, 2, "Stream key", &if k.is_empty() { "Not set. Copy it from your dashboard, then click Paste".to_string() } else { format!("Saved: ••••••{}", k.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<String>()) });
+                cycle(hdc, 2, "Paste");
+                label(hdc, 3, "Stream bitrate", "6000 is a good start for 1080p60 on Twitch");
+                step(hdc, 3, &format!("{} kbps", cfg.stream_kbps));
+                label(hdc, 4, "Frame rate", "30 fps uses less upload bandwidth");
+                cycle(hdc, 4, if cfg.stream_fps30 { "30 fps" } else { "Source" });
+                label(hdc, 5, "Go live", &if live { stream::status_text().unwrap_or_default() } else { "Streams the capture with the GPU encoder".to_string() });
+                toggle(hdc, 5, live);
+                SelectObject(hdc, f_small);
+                let y = panel_row(&pr, 6) + s(6);
+                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(60) };
+                text(hdc, "Your key is stored on this PC only (settings.ini) and is sent to nothing but the server above. RTMPS (Kick, Facebook) is not supported yet. Keep your key private.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
             }
             _ => {
                 let names = ["Record / stop", "Screenshot", "Save replay", "Pause / resume", "Mute microphone"];
@@ -4267,6 +4393,7 @@ fn run() -> R<()> {
         LIGHT.store(cfg.light, Ordering::Relaxed);
         ACCENT_IDX.store(cfg.accent.min(5), Ordering::Relaxed);
         let sh = Arc::new(Shared {
+            stream: Mutex::new(None),
             rec: Mutex::new(None),
             replay: Mutex::new(None),
             preview: Mutex::new(Preview { w: 2, h: 2, data: vec![0u32; 4] }),
