@@ -37,7 +37,7 @@ cargo build --release
 Settings and diagnostics live in `%APPDATA%\lumacap`. Recordings go to `Videos\Lumacap`, screenshots to `Pictures\Lumacap` by default.
 
 ## Streaming
-Settings > Stream: pick Twitch or YouTube (or paste a custom `rtmp://` address), paste your stream key, set a bitrate, then switch on **Go live**. Your key is stored only in `%APPDATA%\lumacap\settings.ini` and is sent only to the server you chose. RTMPS (Kick, Facebook) is not supported yet. Streaming is new and untested on many setups, so please report problems as issues.
+Settings > Stream: pick Twitch or YouTube (or paste a custom `rtmp://` address), click Edit on the key row and paste or type your stream key, set a bitrate, then switch on **Go live**. Your key is stored only in `%APPDATA%\lumacap\settings.ini` and is sent only to the server you chose. RTMPS (Kick, Facebook) is not supported yet. Streaming is new and untested on many setups, so please report problems as issues.
 
 ## Notes
 - Update check: at startup Lumacap asks GitHub for the latest release number (one request, nothing else is sent). Turn it off in Settings > System.

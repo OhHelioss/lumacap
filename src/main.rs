@@ -2376,6 +2376,25 @@ enum K {
     Pick,
 }
 
+/// Inline text editing in the Stream tab: (0 = server address, 1 = stream key, text so far).
+static EDIT: Mutex<Option<(u8, String)>> = Mutex::new(None);
+
+fn edit_commit(sh: &Shared) {
+    let Some((field, text)) = EDIT.lock().unwrap().take() else { return };
+    let text = text.trim().to_string();
+    if field == 0 {
+        if text.starts_with("rtmp://") {
+            sh.cfg.lock().unwrap().stream_custom = text;
+            set_toast(sh, "Server address saved");
+        } else {
+            set_toast(sh, "The address must start with rtmp://");
+        }
+    } else if !text.is_empty() {
+        sh.cfg.lock().unwrap().stream_key = text;
+        set_toast(sh, "Stream key saved");
+    }
+}
+
 fn clipboard_text() -> Option<String> {
     use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
     use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -2695,6 +2714,9 @@ fn sync_volume_cfg() {
 }
 
 unsafe fn click(hwnd: HWND, id: i32, x: i32) {
+    if id != P_ROW0 + 3 * 1 && id != P_ROW0 + 3 * 2 {
+        *EDIT.lock().unwrap() = None;
+    }
     LAST_CLICK.store(id, Ordering::Relaxed);
     let ui = ui();
     let sh = &ui.sh;
@@ -2783,7 +2805,10 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 }
             }
         }
-        P_CLOSE => PANEL.store(false, Ordering::Relaxed),
+        P_CLOSE => {
+            *EDIT.lock().unwrap() = None;
+            PANEL.store(false, Ordering::Relaxed)
+        }
         t if (P_TAB0..P_TAB0 + 5).contains(&t) => TAB.store(t - P_TAB0, Ordering::Relaxed),
         r if r >= P_ROW0 => {
             let (i, which) = ((r - P_ROW0) / 3, (r - P_ROW0) % 3);
@@ -2903,26 +2928,15 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                     c.stream_server = if which == 0 { (c.stream_server + 2) % 3 } else { (c.stream_server + 1) % 3 };
                 }
                 (4, 1) => {
-                    let mut c = sh.cfg.lock().unwrap();
-                    if c.stream_server == 2 {
-                        match clipboard_text() {
-                            Some(tx) if tx.trim().starts_with("rtmp://") => c.stream_custom = tx.trim().to_string(),
-                            Some(_) => {
-                                drop(c);
-                                set_toast(sh, "Clipboard does not hold an rtmp:// address");
-                            }
-                            None => {}
-                        }
+                    let custom = sh.cfg.lock().unwrap().stream_server == 2;
+                    if custom {
+                        *EDIT.lock().unwrap() = Some((0, String::new()));
+                    } else {
+                        set_toast(sh, "Set Service to Custom server to type your own address");
                     }
                 }
                 (4, 2) => {
-                    match clipboard_text() {
-                        Some(tx) if !tx.trim().is_empty() && tx.trim().len() < 300 && !tx.contains('\n') => {
-                            sh.cfg.lock().unwrap().stream_key = tx.trim().to_string();
-                            set_toast(sh, "Stream key pasted");
-                        }
-                        _ => set_toast(sh, "Copy your stream key first, then click Paste"),
-                    }
+                    *EDIT.lock().unwrap() = Some((1, String::new()));
                 }
                 (4, 3) => {
                     let mut c = sh.cfg.lock().unwrap();
@@ -3907,11 +3921,13 @@ unsafe fn paint(hwnd: HWND) {
                 let live = sh.stream.lock().unwrap().is_some();
                 label(hdc, 0, "Service", "Plain rtmp:// servers only (Twitch, YouTube)");
                 cycle(hdc, 0, match cfg.stream_server { 0 => "Twitch", 1 => "YouTube", _ => "Custom server" });
-                label(hdc, 1, "Server address", &if cfg.stream_server == 2 { if cfg.stream_custom.is_empty() { "Not set. Click Paste with an rtmp:// address copied".to_string() } else { cfg.stream_custom.clone() } } else { stream::server_url(&cfg) });
-                cycle(hdc, 1, if cfg.stream_server == 2 { "Paste" } else { "Preset" });
+                let ed = EDIT.lock().unwrap().clone();
+                let caret = if (GetTickCount64() / 500) % 2 == 0 { "|" } else { " " };
+                label(hdc, 1, "Server address", &if let Some((0, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {tx}{caret}") } else if cfg.stream_server == 2 { if cfg.stream_custom.is_empty() { "Not set. Click Edit and type your rtmp:// address".to_string() } else { cfg.stream_custom.clone() } } else { stream::server_url(&cfg) });
+                cycle(hdc, 1, if matches!(&ed, Some((0, _))) { "Editing…" } else if cfg.stream_server == 2 { "Edit" } else { "Preset" });
                 let k = cfg.stream_key.trim();
-                label(hdc, 2, "Stream key", &if k.is_empty() { "Not set. Copy it from your dashboard, then click Paste".to_string() } else { format!("Saved: ••••••{}", k.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<String>()) });
-                cycle(hdc, 2, "Paste");
+                label(hdc, 2, "Stream key", &if let Some((1, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {}{caret}  ({} chars)", "•".repeat(tx.chars().count().min(40)), tx.chars().count()) } else if k.is_empty() { "Not set. Click Edit, then paste your key".to_string() } else { format!("Saved: ••••••{}", k.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<String>()) });
+                cycle(hdc, 2, if matches!(&ed, Some((1, _))) { "Editing…" } else { "Edit" });
                 label(hdc, 3, "Stream bitrate", "6000 is a good start for 1080p60 on Twitch");
                 step(hdc, 3, &format!("{} kbps", cfg.stream_kbps));
                 label(hdc, 4, "Frame rate", "30 fps uses less upload bandwidth");
@@ -4009,6 +4025,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 5 => toggle_mic_mute(),
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN if EDIT.lock().unwrap().is_some() => {
+            if wp.0 as u16 == VK_ESCAPE.0 {
+                *EDIT.lock().unwrap() = None;
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_CHAR if EDIT.lock().unwrap().is_some() => {
+            let ch = wp.0 as u32;
+            match ch {
+                13 => edit_commit(&ui().sh),
+                8 => {
+                    if let Some(e) = EDIT.lock().unwrap().as_mut() {
+                        e.1.pop();
+                    }
+                }
+                22 => {
+                    if let Some(c) = clipboard_text() {
+                        let c: String = c.chars().filter(|x| !x.is_control()).collect();
+                        if let Some(e) = EDIT.lock().unwrap().as_mut() {
+                            e.1.push_str(c.trim());
+                            e.1.truncate(300);
+                        }
+                    }
+                }
+                32..=0xFFFF => {
+                    if let Some(c) = char::from_u32(ch) {
+                        if let Some(e) = EDIT.lock().unwrap().as_mut() {
+                            if e.1.len() < 300 {
+                                e.1.push(c);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN if HK_CAPTURE.load(Ordering::Relaxed) >= 0 => {
