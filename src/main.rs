@@ -3043,6 +3043,12 @@ struct Fast {
 }
 unsafe impl Send for Fast {}
 static FAST: Mutex<Option<Fast>> = Mutex::new(None);
+static NEXT_PRESENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_us() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
 
 unsafe fn free_fast(f: Fast) {
     SelectObject(f.dc, f.old);
@@ -3058,9 +3064,8 @@ unsafe fn draw_preview(hdc: HDC, dx: i32, dy: i32, dw: i32, dh: i32, data: &[u32
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB.0;
-    // 1:1 needs no filtering; HALFTONE only when the picture really is scaled
-    let near = (dw - pvw).abs() <= pvw / 30 && (dh - pvh).abs() <= pvh / 30;
-    SetStretchBltMode(hdc, if near { COLORONCOLOR } else { HALFTONE });
+    // HALFTONE was far too slow for live video at large window sizes
+    SetStretchBltMode(hdc, COLORONCOLOR);
     let _ = SetBrushOrgEx(hdc, 0, 0, None);
     StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, pvw, pvh, Some(data.as_ptr() as *const c_void), &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
@@ -3877,9 +3882,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // While a panel is open the 30 Hz timer does the redraws; frame-driven repaints would starve input.
             let overlay = PANEL.load(Ordering::Relaxed) || LIB_OPEN.load(Ordering::Relaxed) || TRIM_OPEN.load(Ordering::Relaxed);
             if !overlay && !HIDDEN.load(Ordering::Relaxed) {
-                let fast_ok = !MOVING.load(Ordering::Relaxed) && fast_present(hwnd);
-                if !fast_ok && paint_allowed() {
-                    let _ = InvalidateRect(hwnd, None, false);
+                // WM_FRAME is a posted message and posted messages beat mouse/keyboard input. If drawing a frame is
+                // slower than the frame interval the queue never empties and the window looks frozen, so after a slow
+                // present we skip frames for twice as long as it took, keeping the message queue free for input.
+                let t0 = now_us();
+                if t0 >= NEXT_PRESENT_US.load(Ordering::Relaxed) {
+                    let fast_ok = !MOVING.load(Ordering::Relaxed) && fast_present(hwnd);
+                    if fast_ok {
+                        let took = now_us().saturating_sub(t0);
+                        NEXT_PRESENT_US.store(now_us() + (took * 2).min(100_000), Ordering::Relaxed);
+                    } else if paint_allowed() {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                 }
             }
             LRESULT(0)
