@@ -35,6 +35,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount64};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::Networking::WinHttp::{WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Registry::{RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ};
 use windows::Win32::UI::Shell::{
@@ -154,6 +155,9 @@ struct Settings {
     split_min: u32,
     tray: bool,
     autostart: bool,
+    hk_mic: u32,
+    video_name: String,
+    update_check: bool,
 }
 
 fn settings_path() -> String {
@@ -192,6 +196,9 @@ impl Settings {
             split_min: 0,
             tray: false,
             autostart: false,
+            hk_mic: 0x7B,
+            video_name: String::new(),
+            update_check: true,
         }
     }
 
@@ -230,6 +237,9 @@ impl Settings {
                     "split_min" => s.split_min = v.parse().unwrap_or(0),
                     "tray" => s.tray = v == "1",
                     "autostart" => s.autostart = v == "1",
+                    "hk_mic" => s.hk_mic = v.parse().unwrap_or(s.hk_mic),
+                    "video_name" => s.video_name = v.to_string(),
+                    "update_check" => s.update_check = v != "0",
                     _ => {}
                 }
             }
@@ -243,7 +253,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -270,7 +280,10 @@ impl Settings {
             self.hk_pause,
             self.split_min,
             self.tray as u8,
-            self.autostart as u8
+            self.autostart as u8,
+            self.hk_mic,
+            self.video_name,
+            self.update_check as u8
         );
         let _ = std::fs::write(p, txt);
     }
@@ -375,7 +388,7 @@ fn key_allowed(vk: u32) -> bool {
 }
 
 unsafe fn register_hotkeys(hwnd: HWND, c: &Settings) {
-    for (id, vk) in [(1, c.hk_rec), (2, c.hk_shot), (3, c.hk_replay), (4, c.hk_pause)] {
+    for (id, vk) in [(1, c.hk_rec), (2, c.hk_shot), (3, c.hk_replay), (4, c.hk_pause), (5, c.hk_mic)] {
         let _ = UnregisterHotKey(hwnd, id);
         if RegisterHotKey(hwnd, id, MOD_NOREPEAT, vk).is_err() {
             eprintln!("{} is taken by another app; use the on-screen buttons.", vk_name(vk));
@@ -387,7 +400,7 @@ unsafe fn set_hotkey(hwnd: HWND, idx: i32, vk: u32) {
     let sh = ui().sh.clone();
     HK_CAPTURE.store(-1, Ordering::Relaxed);
     let mut c = sh.cfg.lock().unwrap();
-    let cur = [c.hk_rec, c.hk_shot, c.hk_replay, c.hk_pause];
+    let cur = [c.hk_rec, c.hk_shot, c.hk_replay, c.hk_pause, c.hk_mic];
     if cur.iter().enumerate().any(|(i, k)| i as i32 != idx && *k == vk) {
         drop(c);
         set_toast(&sh, "That key is already used by another action");
@@ -398,7 +411,8 @@ unsafe fn set_hotkey(hwnd: HWND, idx: i32, vk: u32) {
         0 => c.hk_rec = v,
         1 => c.hk_shot = v,
         2 => c.hk_replay = v,
-        _ => c.hk_pause = v,
+        3 => c.hk_pause = v,
+        _ => c.hk_mic = v,
     };
     set(&mut c, vk);
     let id = idx + 1;
@@ -411,6 +425,48 @@ unsafe fn set_hotkey(hwnd: HWND, idx: i32, vk: u32) {
         return;
     }
     c.save();
+}
+
+/// Latest release tag from GitHub (e.g. "v0.1.3"), or None when offline.
+fn latest_release_tag() -> Option<String> {
+    unsafe {
+        let session = WinHttpOpen(w!("lumacap"), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, PCWSTR::null(), PCWSTR::null(), 0);
+        if session.is_null() {
+            return None;
+        }
+        let mut body = Vec::new();
+        let connect = WinHttpConnect(session, w!("api.github.com"), 443, 0);
+        if !connect.is_null() {
+            let req = WinHttpOpenRequest(connect, w!("GET"), w!("/repos/OhHelioss/lumacap/releases/latest"), PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE);
+            if !req.is_null() {
+                if WinHttpSendRequest(req, None, None, 0, 0, 0).is_ok() && WinHttpReceiveResponse(req, std::ptr::null_mut()).is_ok() {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let mut got = 0u32;
+                        if WinHttpReadData(req, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut got).is_err() || got == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&buf[..got as usize]);
+                        if body.len() > 256 * 1024 {
+                            break;
+                        }
+                    }
+                }
+                let _ = WinHttpCloseHandle(req);
+            }
+            let _ = WinHttpCloseHandle(connect);
+        }
+        let _ = WinHttpCloseHandle(session);
+        let text = String::from_utf8_lossy(&body).to_string();
+        let key = "\"tag_name\":\"";
+        let i = text.find(key)? + key.len();
+        let j = text[i..].find('"')?;
+        Some(text[i..i + j].to_string())
+    }
+}
+
+fn version_tuple(v: &str) -> Vec<u32> {
+    v.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
 fn free_bytes(dir: &str) -> Option<u64> {
@@ -896,6 +952,8 @@ struct Shared {
     mic_fmt: Mutex<Option<AudioFmt>>,
     mic_err: Mutex<String>,
     mic_names: Vec<String>,
+    video_names: Vec<String>,
+    mic_muted: AtomicBool,
     adevs: Vec<Sendable<IMFActivate>>,
     game_gain: AtomicU32, // percent
     mic_gain: AtomicU32,  // percent
@@ -1410,7 +1468,7 @@ fn audio_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>, af: AudioFmt
             // mix game + mic (with per-source gain) into the recorded track
             let out = if can_mix && !game.is_empty() {
                 let gg = sh.game_gain.load(Ordering::Relaxed) as f32 / 100.0;
-                let mg = sh.mic_gain.load(Ordering::Relaxed) as f32 / 100.0;
+                let mg = if sh.mic_muted.load(Ordering::Relaxed) { 0.0 } else { sh.mic_gain.load(Ordering::Relaxed) as f32 / 100.0 };
                 mixb.clear();
                 {
                     let mut mb = sh.mic_buf.lock().unwrap();
@@ -2292,10 +2350,10 @@ enum K {
 
 fn tab_rows(tab: i32) -> &'static [K] {
     match tab {
-        0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle],
-        1 => &[K::Step, K::Pick, K::Step, K::Toggle],
+        0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick],
+        1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
-        _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle],
+        _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
 }
 
@@ -2346,6 +2404,13 @@ fn start_recording() {
             set_toast(sh, if c.hevc { "Could not start (HEVC needs a hardware encoder)" } else { "Could not start recording" });
         }
     }
+}
+
+fn toggle_mic_mute() {
+    let sh = ui().sh.clone();
+    let m = !sh.mic_muted.load(Ordering::Relaxed);
+    sh.mic_muted.store(m, Ordering::Relaxed);
+    set_toast(&sh, if m { "Microphone muted" } else { "Microphone on" });
 }
 
 fn toggle_pause() {
@@ -2775,6 +2840,35 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                         sh.cfg.lock().unwrap().shot_dir = p;
                     }
                 }
+                (3, 7) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.update_check = !c.update_check;
+                }
+                (1, 4) => {
+                    let m = !sh.mic_muted.load(Ordering::Relaxed);
+                    sh.mic_muted.store(m, Ordering::Relaxed);
+                }
+                (0, 5) => {
+                    let presets = [10u32, 20, 40, 60];
+                    let mut c = sh.cfg.lock().unwrap();
+                    let cur = presets.iter().position(|&p| p >= c.bitrate).unwrap_or(presets.len() - 1);
+                    let next = if which == 0 { (cur + presets.len() - 1) % presets.len() } else { (cur + 1) % presets.len() };
+                    c.bitrate = presets[next];
+                }
+                (0, 6) => {
+                    let n = sh.video_names.len();
+                    if n > 1 {
+                        let name = {
+                            let mut c = sh.cfg.lock().unwrap();
+                            let cur = sh.video_names.iter().position(|v| *v == c.video_name).unwrap_or(0);
+                            let next = if which == 0 { (cur + n - 1) % n } else { (cur + 1) % n };
+                            c.video_name = sh.video_names[next].clone();
+                            c.video_name.clone()
+                        };
+                        let _ = name;
+                        set_toast(sh, "Restart Lumacap to switch capture card");
+                    }
+                }
                 (0, 4) => {
                     let mut c = sh.cfg.lock().unwrap();
                     c.split_min = match c.split_min {
@@ -2784,11 +2878,11 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                         _ => 0,
                     };
                 }
-                (3, k) if k < 4 => {
+                (3, k) if k < 5 => {
                     let cur = HK_CAPTURE.load(Ordering::Relaxed);
                     HK_CAPTURE.store(if cur == k { -1 } else { k }, Ordering::Relaxed);
                 }
-                (3, 4) => {
+                (3, 5) => {
                     let on = {
                         let mut c = sh.cfg.lock().unwrap();
                         c.tray = !c.tray;
@@ -2804,7 +2898,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                         tray_remove(hwnd);
                     }
                 }
-                (3, 5) => {
+                (3, 6) => {
                     let (on, need_tray) = {
                         let mut c = sh.cfg.lock().unwrap();
                         c.autostart = !c.autostart;
@@ -3625,12 +3719,20 @@ unsafe fn paint(hwnd: HWND) {
                     30 => "Every 30 min",
                     _ => "Every 60 min",
                 });
+                label(hdc, 5, "Quality", "Preset for the bitrate above");
+                cycle(hdc, 5, match cfg.bitrate {
+                    10 => "Small",
+                    20 => "Balanced",
+                    40 => "High",
+                    60 => "Max",
+                    _ => "Custom",
+                });
+                label(hdc, 6, "Capture card", "Takes effect after restarting Lumacap");
+                pick(hdc, 6, if cfg.video_name.is_empty() { &ui.device } else { &cfg.video_name });
                 SelectObject(hdc, f_small);
-                let y = panel_row(&pr, 5) + s(6);
+                let y = panel_row(&pr, 7) + s(2);
                 let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(20) };
-                text(hdc, &format!("Capture: {}", MODE.lock().unwrap()), &mut m1, muted_c, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-                let mut m2 = RECT { left: pr.left + s(28), top: y + s(22), right: pr.right - s(28), bottom: y + s(42) };
-                text(hdc, &format!("Glitched/dropped frames this session: {}", sh.glitches.load(Ordering::Relaxed)), &mut m2, muted_c, DT_LEFT | DT_SINGLELINE);
+                text(hdc, &format!("{}  ·  {} glitched frames", MODE.lock().unwrap(), sh.glitches.load(Ordering::Relaxed)), &mut m1, muted_c, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
             }
             1 => {
                 label(hdc, 0, "Game volume", "What you hear and what is recorded (0 = silent)");
@@ -3655,8 +3757,10 @@ unsafe fn paint(hwnd: HWND) {
                 }
                 label(hdc, 3, "Separate mic file", "Also saves your mic alone as a .m4a next to the video");
                 toggle(hdc, 3, cfg.mic_separate);
+                label(hdc, 4, "Mute microphone", &format!("Also on the {} key", vk_name(cfg.hk_mic)));
+                toggle(hdc, 4, sh.mic_muted.load(Ordering::Relaxed));
                 SelectObject(hdc, f_small);
-                let y = panel_row(&pr, 4) + s(6);
+                let y = panel_row(&pr, 5) + s(6);
                 let playing = MON_PLAYING.load(Ordering::Relaxed);
                 let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(20) };
                 text(hdc, if playing { "Lumacap is playing the game sound through your speakers." } else { "Lumacap is not playing any game sound (volume at 0 or muted)." }, &mut m1, muted_c, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -3694,17 +3798,19 @@ unsafe fn paint(hwnd: HWND) {
                 cycle(hdc, 7, "Change");
             }
             _ => {
-                let names = ["Record / stop", "Screenshot", "Save replay", "Pause / resume"];
-                let keys = [cfg.hk_rec, cfg.hk_shot, cfg.hk_replay, cfg.hk_pause];
+                let names = ["Record / stop", "Screenshot", "Save replay", "Pause / resume", "Mute microphone"];
+                let keys = [cfg.hk_rec, cfg.hk_shot, cfg.hk_replay, cfg.hk_pause, cfg.hk_mic];
                 let cap = HK_CAPTURE.load(Ordering::Relaxed);
-                for i in 0..4usize {
+                for i in 0..5usize {
                     label(hdc, i as i32, names[i], if cap == i as i32 { "Press the new key (Esc to cancel)" } else { "Works while a game is focused. Click, then press a key" });
                     cycle(hdc, i as i32, &if cap == i as i32 { "Press a key…".to_string() } else { vk_name(keys[i]) });
                 }
-                label(hdc, 4, "Minimize to tray", "Closing the window keeps recording and replay running");
-                toggle(hdc, 4, cfg.tray);
-                label(hdc, 5, "Start with Windows", "Starts hidden in the tray, ready for instant replay");
-                toggle(hdc, 5, cfg.autostart);
+                label(hdc, 5, "Minimize to tray", "Closing the window keeps recording and replay running");
+                toggle(hdc, 5, cfg.tray);
+                label(hdc, 6, "Start with Windows", "Starts hidden in the tray, ready for instant replay");
+                toggle(hdc, 6, cfg.autostart);
+                label(hdc, 7, "Check for updates", "Asks GitHub for the latest version at startup; nothing else is sent");
+                toggle(hdc, 7, cfg.update_check);
             }
         }
     }
@@ -3762,7 +3868,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     1 => c.hk_rec,
                     2 => c.hk_shot,
                     3 => c.hk_replay,
-                    _ => c.hk_pause,
+                    4 => c.hk_pause,
+                    _ => c.hk_mic,
                 };
                 set_hotkey(hwnd, cap, vk);
                 let _ = InvalidateRect(hwnd, None, false);
@@ -3773,6 +3880,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 2 => take_screenshot(),
                 3 => save_replay(ui().sh.clone()),
                 4 => toggle_pause(),
+                5 => toggle_mic_mute(),
                 _ => {}
             }
             LRESULT(0)
@@ -4101,7 +4209,11 @@ fn run() -> R<()> {
             return Ok(());
         }
 
-        let want_v = arg(&args, "--video").and_then(|s| s.parse().ok());
+        let saved_v = {
+            let n = Settings::load().video_name;
+            if n.is_empty() { None } else { vdevs.iter().position(|d| friendly_name(d) == n) }
+        };
+        let want_v = arg(&args, "--video").and_then(|s| s.parse().ok()).or(saved_v);
         let vi = pick(&vdevs, want_v, &["hd60", "elgato", "game capture"]).or(if vdevs.is_empty() { None } else { Some(0) });
         let Some(vi) = vi else {
             msgbox("No video capture device found. Is the HD60 S plugged into a USB 3.0 port?");
@@ -4151,6 +4263,7 @@ fn run() -> R<()> {
         let can_mix = audio.as_ref().map(|a| (a.1.float || a.1.bits == 16) && a.1.ch >= 1).unwrap_or(false);
         let rec_afmt = audio.as_ref().map(|a| if can_mix { AudioFmt { float: false, rate: a.1.rate, ch: 2, bits: 16 } } else { a.1 });
         let mic_names: Vec<String> = adevs.iter().map(|d| friendly_name(d)).collect();
+        let video_names: Vec<String> = vdevs.iter().map(|d| friendly_name(d)).collect();
         LIGHT.store(cfg.light, Ordering::Relaxed);
         ACCENT_IDX.store(cfg.accent.min(5), Ordering::Relaxed);
         let sh = Arc::new(Shared {
@@ -4182,6 +4295,8 @@ fn run() -> R<()> {
             mic_fmt: Mutex::new(None),
             mic_err: Mutex::new(String::new()),
             mic_names,
+            video_names,
+            mic_muted: AtomicBool::new(false),
             adevs: adevs.into_iter().map(Sendable).collect(),
             game_gain: AtomicU32::new(cfg.game_gain),
             mic_gain: AtomicU32::new(cfg.mic_gain),
@@ -4197,6 +4312,17 @@ fn run() -> R<()> {
         let vt = std::thread::spawn(move || video_thread(vr, sh_v));
         let sh_p = sh.clone();
         std::thread::spawn(move || preview_thread(sh_p));
+        if cfg.update_check {
+            let sh_u = sh.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(6));
+                if let Some(tag) = latest_release_tag() {
+                    if version_tuple(&tag) > version_tuple(env!("CARGO_PKG_VERSION")) {
+                        set_toast(&sh_u, &format!("Update available: {tag} (github.com/OhHelioss/lumacap/releases)"));
+                    }
+                }
+            });
+        }
         let at = audio.map(|(r, af)| {
             let sh_a = sh.clone();
             let r = Sendable(r);

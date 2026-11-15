@@ -1,0 +1,40 @@
+name: Bug report
+description: Something is broken or behaves wrongly
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Lumacap version
+      placeholder: e.g. v0.1.3
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Capture card
+      placeholder: e.g. Elgato HD60 S, USB 3.0 port
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Windows version and GPU
+      placeholder: e.g. Windows 11 23H2, AMD RX 9060 XT
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste `crash.txt` / `diag.txt` from `%APPDATA%\lumacap` if they exist. Settings > Video also shows the capture mode.
