@@ -8,6 +8,7 @@
 
 mod h264;
 mod rtmp;
+mod scene;
 mod stream;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -162,11 +163,17 @@ struct Settings {
     hk_mic: u32,
     video_name: String,
     update_check: bool,
-    stream_server: u32, // 0 Twitch, 1 YouTube, 2 custom
+    stream_server: u32, // 0 Twitch, 1 YouTube, 2 custom, 3 Facebook
     stream_custom: String,
     stream_key: String,
     stream_kbps: u32,
     stream_fps30: bool,
+    zoom: u32, // index into scene::ZOOMS
+    pan_x: u32,
+    pan_y: u32,
+    cam_name: String,
+    cam_pos: u32,
+    cam_size: u32,
 }
 
 fn settings_path() -> String {
@@ -213,6 +220,12 @@ impl Settings {
             stream_key: String::new(),
             stream_kbps: 6000,
             stream_fps30: false,
+            zoom: 0,
+            pan_x: 50,
+            pan_y: 50,
+            cam_name: String::new(),
+            cam_pos: 3,
+            cam_size: 1,
         }
     }
 
@@ -254,11 +267,17 @@ impl Settings {
                     "hk_mic" => s.hk_mic = v.parse().unwrap_or(s.hk_mic),
                     "video_name" => s.video_name = v.to_string(),
                     "update_check" => s.update_check = v != "0",
-                    "stream_server" => s.stream_server = v.parse().unwrap_or(0).min(2),
+                    "stream_server" => s.stream_server = v.parse().unwrap_or(0).min(3),
                     "stream_custom" => s.stream_custom = v.to_string(),
                     "stream_key" => s.stream_key = v.to_string(),
                     "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
                     "stream_fps30" => s.stream_fps30 = v == "1",
+                    "zoom" => s.zoom = v.parse().unwrap_or(0).min(4),
+                    "pan_x" => s.pan_x = v.parse().unwrap_or(50).min(100),
+                    "pan_y" => s.pan_y = v.parse().unwrap_or(50).min(100),
+                    "cam_name" => s.cam_name = v.to_string(),
+                    "cam_pos" => s.cam_pos = v.parse().unwrap_or(3).min(3),
+                    "cam_size" => s.cam_size = v.parse().unwrap_or(1).min(2),
                     _ => {}
                 }
             }
@@ -272,7 +291,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -307,7 +326,13 @@ impl Settings {
             self.stream_custom,
             self.stream_key,
             self.stream_kbps,
-            self.stream_fps30 as u8
+            self.stream_fps30 as u8,
+            self.zoom,
+            self.pan_x,
+            self.pan_y,
+            self.cam_name,
+            self.cam_pos,
+            self.cam_size
         );
         let _ = std::fs::write(p, txt);
     }
@@ -1197,6 +1222,10 @@ fn video_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>) {
                 }
             } else {
                 sample
+            };
+            let sample = match scene::process(w, h, &sample) {
+                Some(s) => s,
+                None => sample,
             };
             sh.frames.fetch_add(1, Ordering::Relaxed);
 
@@ -2262,6 +2291,7 @@ const C_GEAR: i32 = 7;
 const C_PAUSE: i32 = 8;
 const C_LIB: i32 = 9;
 const L_CLOSE: i32 = 60;
+const L_FOLDER: i32 = 61;
 const L_ROW0: i32 = 100; // visible row i: 100+4i play, +1 trim, +2 show, +3 delete
 const L_VIS: i32 = 6;
 const T_CLOSE: i32 = 70;
@@ -2425,7 +2455,8 @@ fn tab_rows(tab: i32) -> &'static [K] {
         0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick],
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
-        4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle],
+        4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle, K::Change],
+        5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle],
         _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
 }
@@ -2616,6 +2647,7 @@ fn controls(rc: &RECT) -> Vec<(i32, RECT)> {
     if LIB_OPEN.load(Ordering::Relaxed) {
         let pr = lib_panel_rect(rc);
         v.push((L_CLOSE, sq(pr.right - s(36), pr.top + s(36), s(18))));
+        v.push((L_FOLDER, btn(pr.right - s(170), pr.top + s(20), s(114), s(32))));
         let n = LIB.lock().unwrap().len() as i32;
         let off = LIB_SCROLL.load(Ordering::Relaxed);
         for i in 0..L_VIS {
@@ -2632,8 +2664,8 @@ fn controls(rc: &RECT) -> Vec<(i32, RECT)> {
     if PANEL.load(Ordering::Relaxed) {
         let pr = panel_rect(rc);
         v.push((P_CLOSE, sq(pr.right - s(36), pr.top + s(36), s(18))));
-        for t in 0..5 {
-            v.push((P_TAB0 + t, btn(pr.left + s(28) + t * s(98), pr.top + s(66), s(92), s(34))));
+        for t in 0..6 {
+            v.push((P_TAB0 + t, btn(pr.left + s(28) + t * s(80), pr.top + s(66), s(76), s(34))));
         }
         for (i, k) in tab_rows(TAB.load(Ordering::Relaxed)).iter().enumerate() {
             let i = i as i32;
@@ -2752,6 +2784,11 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
             LIB_OPEN.store(true, Ordering::Relaxed);
         }
         L_CLOSE => LIB_OPEN.store(false, Ordering::Relaxed),
+        L_FOLDER => {
+            let dir = sh.cfg.lock().unwrap().out_dir.clone();
+            let _ = std::fs::create_dir_all(&dir);
+            lib_shell(w!("open"), &dir, "");
+        }
         T_CLOSE => trim_close(),
         T_TL => {
             trim_set_from_x(&rc, x);
@@ -2809,7 +2846,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
             *EDIT.lock().unwrap() = None;
             PANEL.store(false, Ordering::Relaxed)
         }
-        t if (P_TAB0..P_TAB0 + 5).contains(&t) => TAB.store(t - P_TAB0, Ordering::Relaxed),
+        t if (P_TAB0..P_TAB0 + 6).contains(&t) => TAB.store(t - P_TAB0, Ordering::Relaxed),
         r if r >= P_ROW0 => {
             let (i, which) = ((r - P_ROW0) / 3, (r - P_ROW0) % 3);
             let tab = TAB.load(Ordering::Relaxed);
@@ -2925,10 +2962,10 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 }
                 (4, 0) => {
                     let mut c = sh.cfg.lock().unwrap();
-                    c.stream_server = if which == 0 { (c.stream_server + 2) % 3 } else { (c.stream_server + 1) % 3 };
+                    c.stream_server = stream::next_service(c.stream_server, which != 0);
                 }
                 (4, 1) => {
-                    let custom = sh.cfg.lock().unwrap().stream_server == 2;
+                    let custom = stream::is_custom(&sh.cfg.lock().unwrap());
                     if custom {
                         *EDIT.lock().unwrap() = Some((0, String::new()));
                     } else {
@@ -2945,6 +2982,46 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 (4, 4) => {
                     let mut c = sh.cfg.lock().unwrap();
                     c.stream_fps30 = !c.stream_fps30;
+                }
+                (4, 6) => stream::test_connection(),
+                (5, 0) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.zoom = if which == 0 { c.zoom.saturating_sub(1) } else { (c.zoom + 1).min(4) };
+                    scene::sync(&c);
+                }
+                (5, 1) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.pan_x = step_u32(c.pan_x, which, 10, 0, 100);
+                    scene::sync(&c);
+                }
+                (5, 2) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.pan_y = step_u32(c.pan_y, which, 10, 0, 100);
+                    scene::sync(&c);
+                }
+                (5, 3) => {
+                    let names: Vec<String> = sh.video_names.iter().filter(|n| **n != ui.device).cloned().collect();
+                    let cur = sh.cfg.lock().unwrap().cam_name.clone();
+                    // list: Off, then every other video device
+                    let pos = if cur.is_empty() { 0 } else { names.iter().position(|n| *n == cur).map(|i| i + 1).unwrap_or(0) };
+                    let n = names.len() + 1;
+                    let next = if which == 0 { (pos + n - 1) % n } else { (pos + 1) % n };
+                    let name = if next == 0 { String::new() } else { names[next - 1].clone() };
+                    sh.cfg.lock().unwrap().cam_name = name.clone();
+                    scene::set_cam(&name, &ui.device);
+                    if names.is_empty() {
+                        set_toast(sh, "No webcam found");
+                    }
+                }
+                (5, 4) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.cam_pos = (c.cam_pos + 1) % 4;
+                    scene::sync(&c);
+                }
+                (5, 5) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.cam_size = (c.cam_size + 1) % 3;
+                    scene::sync(&c);
                 }
                 (4, 5) => {
                     if sh.stream.lock().unwrap().is_some() {
@@ -3320,14 +3397,15 @@ unsafe fn draw_chips(hdc: HDC, dx: i32, dy: i32, dw: i32, rec: &Option<(u64, boo
         let mut tr = RECT { left: pill.left, top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
         text(hdc, label_t, &mut tr, white, DT_CENTER | DT_SINGLELINE);
     }
-    if let Some(secs) = stream::live_secs() {
+    if let Some((label_t, warn)) = stream::chip_text() {
         SelectObject(hdc, f_bold);
         let top = dy + if rec.is_some() { s(58) } else if replay.is_some() { s(54) } else { s(16) };
-        let pill = RECT { left: dx + s(16), top, right: dx + s(176), bottom: top + s(34) };
+        let wpx = s(56) + label_t.chars().count() as i32 * s(9);
+        let pill = RECT { left: dx + s(16), top, right: dx + s(16) + wpx, bottom: top + s(34) };
         chip(hdc, &pill);
-        circle(hdc, (pill.left + s(20), (pill.top + pill.bottom) / 2), s(6), rgb(145, 80, 255), None);
+        circle(hdc, (pill.left + s(20), (pill.top + pill.bottom) / 2), s(6), if warn { rgb(240, 190, 40) } else { rgb(145, 80, 255) }, None);
         let mut tr = RECT { left: pill.left + s(38), top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
-        text(hdc, &format!("LIVE {:02}:{:02}", secs / 60, secs % 60), &mut tr, white, DT_LEFT | DT_SINGLELINE);
+        text(hdc, &label_t, &mut tr, white, DT_LEFT | DT_SINGLELINE);
     }
     SelectObject(hdc, GetStockObject(SYSTEM_FONT));
     let _ = DeleteObject(f_bold);
@@ -3623,6 +3701,14 @@ unsafe fn paint(hwnd: HWND) {
         }
         SelectObject(hdc, f_icon);
         glyph(hdc, 0xE711, &cb, white);
+        {
+            let fr = rect_of(L_FOLDER);
+            round_rect(hdc, &fr, s(10), if hover == L_FOLDER { rgb(49, 54, 65) } else { rgb(38, 42, 51) }, None);
+            SelectObject(hdc, f_norm);
+            let mut tr = fr;
+            tr.top += s(5);
+            text(hdc, "Open folder", &mut tr, white, DT_CENTER | DT_SINGLELINE);
+        }
         let items = LIB.lock().unwrap().clone();
         let off = LIB_SCROLL.load(Ordering::Relaxed);
         if items.is_empty() {
@@ -3774,7 +3860,7 @@ unsafe fn paint(hwnd: HWND) {
         glyph(hdc, 0xE711, &cb, white);
 
         let tab = TAB.load(Ordering::Relaxed);
-        for (i, name) in ["Video", "Audio", "General", "System", "Stream"].iter().enumerate() {
+        for (i, name) in ["Video", "Audio", "General", "System", "Stream", "Scene"].iter().enumerate() {
             let r = rect_of(P_TAB0 + i as i32);
             let sel = tab == i as i32;
             let fill = if sel { accent } else if hover == P_TAB0 + i as i32 { rgb(49, 54, 65) } else { rgb(38, 42, 51) };
@@ -3917,27 +4003,47 @@ unsafe fn paint(hwnd: HWND) {
                 label(hdc, 7, "Screenshots folder", &cfg.shot_dir);
                 cycle(hdc, 7, "Change");
             }
+            5 => {
+                label(hdc, 0, "Zoom", "Crops the picture and scales it back up");
+                pick(hdc, 0, &format!("{}%", scene::ZOOMS[(cfg.zoom as usize).min(4)]));
+                label(hdc, 1, "Pan left / right", "Where the zoomed area sits");
+                step(hdc, 1, &format!("{}%", cfg.pan_x));
+                label(hdc, 2, "Pan up / down", "Where the zoomed area sits");
+                step(hdc, 2, &format!("{}%", cfg.pan_y));
+                label(hdc, 3, "Webcam overlay", "Shown in the preview, recordings, screenshots and streams");
+                pick(hdc, 3, if cfg.cam_name.is_empty() { "Off" } else { &cfg.cam_name });
+                label(hdc, 4, "Webcam position", "Corner of the picture");
+                cycle(hdc, 4, scene::CAM_POS[(cfg.cam_pos as usize).min(3)]);
+                label(hdc, 5, "Webcam size", "Width relative to the picture");
+                cycle(hdc, 5, scene::SIZE_NAMES[(cfg.cam_size as usize).min(2)]);
+                SelectObject(hdc, f_small);
+                let y = panel_row(&pr, 6) + s(6);
+                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(60) };
+                text(hdc, "Zoom and webcam are experimental. Zoom 100% with the webcam off leaves the picture untouched.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
+            }
             4 => {
                 let live = sh.stream.lock().unwrap().is_some();
-                label(hdc, 0, "Service", "Plain rtmp:// servers only (Twitch, YouTube)");
-                cycle(hdc, 0, match cfg.stream_server { 0 => "Twitch", 1 => "YouTube", _ => "Custom server" });
+                label(hdc, 0, "Service", "For Kick or others, choose Custom and paste your server address");
+                cycle(hdc, 0, stream::service_name(cfg.stream_server));
                 let ed = EDIT.lock().unwrap().clone();
                 let caret = if (GetTickCount64() / 500) % 2 == 0 { "|" } else { " " };
-                label(hdc, 1, "Server address", &if let Some((0, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {tx}{caret}") } else if cfg.stream_server == 2 { if cfg.stream_custom.is_empty() { "Not set. Click Edit and type your rtmp:// address".to_string() } else { cfg.stream_custom.clone() } } else { stream::server_url(&cfg) });
-                cycle(hdc, 1, if matches!(&ed, Some((0, _))) { "Editing…" } else if cfg.stream_server == 2 { "Edit" } else { "Preset" });
+                label(hdc, 1, "Server address", &if let Some((0, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {tx}{caret}") } else if stream::is_custom(&cfg) { if cfg.stream_custom.is_empty() { "Not set. Click Edit and type your rtmp:// or rtmps:// address".to_string() } else { cfg.stream_custom.clone() } } else { stream::server_url(&cfg) });
+                cycle(hdc, 1, if matches!(&ed, Some((0, _))) { "Editing…" } else if stream::is_custom(&cfg) { "Edit" } else { "Preset" });
                 let k = cfg.stream_key.trim();
                 label(hdc, 2, "Stream key", &if let Some((1, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {}{caret}  ({} chars)", "•".repeat(tx.chars().count().min(40)), tx.chars().count()) } else if k.is_empty() { "Not set. Click Edit, then paste your key".to_string() } else { format!("Saved: ••••••{}", k.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<String>()) });
                 cycle(hdc, 2, if matches!(&ed, Some((1, _))) { "Editing…" } else { "Edit" });
-                label(hdc, 3, "Stream bitrate", "6000 is a good start for 1080p60 on Twitch");
+                label(hdc, 3, "Stream bitrate", stream::bitrate_hint(&cfg));
                 step(hdc, 3, &format!("{} kbps", cfg.stream_kbps));
                 label(hdc, 4, "Frame rate", "30 fps uses less upload bandwidth");
                 cycle(hdc, 4, if cfg.stream_fps30 { "30 fps" } else { "Source" });
                 label(hdc, 5, "Go live", &if live { stream::status_text().unwrap_or_default() } else { "Streams the capture with the GPU encoder".to_string() });
                 toggle(hdc, 5, live);
                 SelectObject(hdc, f_small);
-                let y = panel_row(&pr, 6) + s(6);
-                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(60) };
-                text(hdc, "Your key is stored on this PC only (settings.ini) and is sent to nothing but the server above. RTMPS (Kick, Facebook) is not supported yet. Keep your key private.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
+                label(hdc, 6, "Test connection", "Connects and disconnects without sending video");
+                cycle(hdc, 6, "Test");
+                let y = panel_row(&pr, 7) + s(2);
+                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(40) };
+                text(hdc, "Your key is stored on this PC only (settings.ini) and is sent to nothing but the server above. Keep it private.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
             }
             _ => {
                 let names = ["Record / stop", "Screenshot", "Save replay", "Pause / resume", "Mute microphone"];
@@ -4494,6 +4600,11 @@ fn run() -> R<()> {
         let vt = std::thread::spawn(move || video_thread(vr, sh_v));
         let sh_p = sh.clone();
         std::thread::spawn(move || preview_thread(sh_p));
+        scene::sync(&cfg);
+        if !cfg.cam_name.is_empty() {
+            let dev = ui().device.clone();
+            scene::set_cam(&cfg.cam_name, &dev);
+        }
         if cfg.update_check {
             let sh_u = sh.clone();
             std::thread::spawn(move || {

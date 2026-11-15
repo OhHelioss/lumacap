@@ -15,7 +15,8 @@ A tiny, fast, open-source recorder for capture cards on Windows. One exe, no ins
 - Quality presets (Small / Balanced / High / Max), capture-card picker
 - Low-disk-space warning and auto-stop, optional auto-split of long recordings (15/30/60 min)
 - Minimize to tray and start with Windows
-- Built-in live streaming over RTMP (Twitch, YouTube, or any `rtmp://` server) with the GPU encoder, no OBS needed
+- Built-in live streaming over RTMP/RTMPS (Twitch, YouTube, Facebook, Kick or any custom server) with the GPU encoder, auto-reconnect and a live bitrate readout, no OBS needed
+- Scene tab: digital zoom with pan and a webcam picture-in-picture (experimental)
 - Light/dark theme and accent colours
 
 ## Download
@@ -37,7 +38,10 @@ cargo build --release
 Settings and diagnostics live in `%APPDATA%\lumacap`. Recordings go to `Videos\Lumacap`, screenshots to `Pictures\Lumacap` by default.
 
 ## Streaming
-Settings > Stream: pick Twitch or YouTube (or paste a custom `rtmp://` address), click Edit on the key row and paste or type your stream key, set a bitrate, then switch on **Go live**. Your key is stored only in `%APPDATA%\lumacap\settings.ini` and is sent only to the server you chose. RTMPS (Kick, Facebook) is not supported yet. Streaming is new and untested on many setups, so please report problems as issues.
+Settings > Stream: pick Twitch, YouTube or Facebook (or choose Custom and type your server address, e.g. the `rtmps://...` address Kick shows in its dashboard), click **Edit** on the key row and paste your stream key, set a bitrate, then switch on **Go live**. **Test connection** checks the address and key without sending video. If the connection drops, Lumacap retries for about a minute. Your key is stored only in `%APPDATA%\lumacap\settings.ini` and is sent only to the server you chose. Streaming is new and untested on many setups, so please report problems as issues.
+
+## Scene (experimental)
+Settings > Scene: zoom (100% to 300%) with pan, and a webcam overlay in any corner. Both are applied to the preview, recordings, screenshots and streams.
 
 ## Notes
 - Update check: at startup Lumacap asks GitHub for the latest release number (one request, nothing else is sent). Turn it off in Settings > System.

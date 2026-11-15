@@ -238,30 +238,111 @@ fn lock(w: &Arc<Mutex<Writer>>) -> Res<std::sync::MutexGuard<'_, Writer>> {
     w.lock().map_err(|_| "internal error".to_string())
 }
 
-fn parse_url(url: &str) -> Res<(String, u16, String)> {
-    let rest = url.strip_prefix("rtmp://").ok_or_else(|| {
-        if url.starts_with("rtmps://") {
-            "RTMPS (encrypted) servers are not supported yet. Use an rtmp:// server".to_string()
-        } else {
-            "the server address must start with rtmp://".to_string()
-        }
-    })?;
-    let (hostport, path) = rest.split_once('/').ok_or("the server address needs an application, e.g. rtmp://host/app")?;
+/// Returns (host, port, app, secure).
+fn parse_url(url: &str) -> Res<(String, u16, String, bool)> {
+    let (rest, secure) = if let Some(r) = url.strip_prefix("rtmps://") {
+        (r, true)
+    } else if let Some(r) = url.strip_prefix("rtmp://") {
+        (r, false)
+    } else {
+        return Err("the server address must start with rtmp:// or rtmps://".to_string());
+    };
+    let (hostport, path) = match rest.split_once('/') {
+        Some((h, p)) => (h, p),
+        None if secure => (rest, "app"), // some services (Kick) show only the host
+        None => return Err("the server address needs an application, e.g. rtmp://host/app".into()),
+    };
+    let path = if path.trim_matches('/').is_empty() { "app" } else { path };
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| "bad port in server address".to_string())?),
-        None => (hostport.to_string(), 1935),
+        None => (hostport.to_string(), if secure { 443 } else { 1935 }),
     };
-    if host.is_empty() || path.is_empty() {
+    if host.is_empty() {
         return Err("incomplete server address".into());
     }
-    Ok((host, port, path.trim_end_matches('/').to_string()))
+    Ok((host, port, path.trim_end_matches('/').to_string(), secure))
+}
+
+/// RTMPS: terminate TLS in a small local relay so the rest of the code can keep speaking plain TCP.
+/// Does the TLS handshake now (so certificate/connection errors are reported), then relays in a thread.
+fn tls_relay(host: &str, port: u16, roots: rustls::RootCertStore) -> Res<u16> {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    let cfg = Arc::new(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth());
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| "bad server name".to_string())?;
+    let mut conn = rustls::ClientConnection::new(cfg, name).map_err(|e| e.to_string())?;
+    let addr = io((host, port).to_socket_addrs())?.next().ok_or("could not resolve the server")?;
+    let mut sock = io(TcpStream::connect_timeout(&addr, Duration::from_secs(8)))?;
+    let _ = sock.set_nodelay(true);
+    let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = sock.set_write_timeout(Some(Duration::from_secs(10)));
+    while conn.is_handshaking() {
+        conn.complete_io(&mut sock).map_err(|e| format!("secure connection failed: {e}"))?;
+    }
+    let listener = io(std::net::TcpListener::bind(("127.0.0.1", 0)))?;
+    let lport = io(listener.local_addr())?.port();
+    std::thread::spawn(move || {
+        let Ok((mut local, _)) = listener.accept() else { return };
+        let _ = local.set_nodelay(true);
+        let _ = local.set_nonblocking(true);
+        let _ = sock.set_read_timeout(Some(Duration::from_millis(4)));
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match local.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tls.write_all(&buf[..n]).is_err() || tls.flush().is_err() {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == WouldBlock => {}
+                Err(_) => break,
+            }
+            match tls.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut off = 0;
+                    while off < n {
+                        match local.write(&buf[off..n]) {
+                            Ok(0) => return,
+                            Ok(m) => off += m,
+                            Err(e) if e.kind() == WouldBlock => std::thread::sleep(Duration::from_millis(1)),
+                            Err(_) => return,
+                        }
+                    }
+                }
+                Err(e) if e.kind() == WouldBlock || e.kind() == TimedOut => {}
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(lport)
+}
+
+fn web_roots() -> rustls::RootCertStore {
+    let mut r = rustls::RootCertStore::empty();
+    r.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    r
 }
 
 impl Publisher {
     /// Connect and start publishing `key` to `url` (e.g. `rtmp://live.twitch.tv/app`).
     pub fn connect(url: &str, key: &str) -> Res<Publisher> {
-        let (host, port, app) = parse_url(url)?;
-        let addr = io((host.as_str(), port).to_socket_addrs())?.next().ok_or("could not resolve the server")?;
+        Self::connect_with(url, key, web_roots())
+    }
+
+    pub(crate) fn connect_with(url: &str, key: &str, roots: rustls::RootCertStore) -> Res<Publisher> {
+        let (host, port, app, secure) = parse_url(url)?;
+        let addr = if secure {
+            let lp = tls_relay(&host, port, roots)?;
+            std::net::SocketAddr::from(([127, 0, 0, 1], lp))
+        } else {
+            io((host.as_str(), port).to_socket_addrs())?.next().ok_or("could not resolve the server")?
+        };
         let mut s = io(TcpStream::connect_timeout(&addr, Duration::from_secs(8)))?;
         let _ = s.set_nodelay(true);
         let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
@@ -297,7 +378,7 @@ impl Publisher {
         lock(&w)?.send_msg(CSID_CTRL, 0, 1, 0, &(CHUNK_OUT as u32).to_be_bytes())?;
 
         // connect
-        let tc = format!("rtmp://{}:{}/{}", host, port, app);
+        let tc = format!("{}://{}:{}/{}", if secure { "rtmps" } else { "rtmp" }, host, port, app);
         let mut p = Vec::new();
         amf_str(&mut p, "connect");
         amf_num(&mut p, 1.0);
@@ -517,9 +598,11 @@ mod tests {
 
     #[test]
     fn url_parsing() {
-        assert_eq!(parse_url("rtmp://live.twitch.tv/app").unwrap(), ("live.twitch.tv".into(), 1935, "app".into()));
-        assert_eq!(parse_url("rtmp://127.0.0.1:19350/live").unwrap(), ("127.0.0.1".into(), 19350, "live".into()));
-        assert!(parse_url("rtmps://x/y").unwrap_err().contains("RTMPS"));
+        let p = |u: &str| parse_url(u).unwrap();
+        assert_eq!(p("rtmp://live.twitch.tv/app"), ("live.twitch.tv".into(), 1935, "app".into(), false));
+        assert_eq!(p("rtmp://127.0.0.1:19350/live"), ("127.0.0.1".into(), 19350, "live".into(), false));
+        assert_eq!(p("rtmps://live-api-s.facebook.com:443/rtmp/"), ("live-api-s.facebook.com".into(), 443, "rtmp".into(), true));
+        assert_eq!(p("rtmps://abc.global-contribute.live-video.net"), ("abc.global-contribute.live-video.net".into(), 443, "app".into(), true));
         assert!(parse_url("http://x/y").is_err());
         assert!(parse_url("rtmp://host").is_err());
     }

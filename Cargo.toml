@@ -1,6 +1,6 @@
 [package]
 name = "lumacap"
-version = "0.2.1"
+version = "0.3.0"
 description = "Lightweight, open-source capture-card recorder for Windows (Media Foundation, GPU encoding)"
 license = "MIT"
 repository = "https://github.com/OhHelioss/lumacap"
@@ -30,6 +30,9 @@ windows = { version = "0.58", features = [
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
 
 [build-dependencies]
 embed-resource = "2"
