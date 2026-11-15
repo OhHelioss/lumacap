@@ -347,6 +347,7 @@ unsafe fn apply_titlebar(hwnd: HWND, light: bool) {
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
 }
 
+static MON_PLAYING: AtomicBool = AtomicBool::new(false);
 static LAST_FPS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HK_CAPTURE: AtomicI32 = AtomicI32::new(-1);
 static QUITTING: AtomicBool = AtomicBool::new(false);
@@ -1318,6 +1319,11 @@ impl Monitor {
         // all buffers busy: drop this chunk (keeps latency bounded)
     }
 
+    /// Drop everything that is queued so a volume change or mute is heard immediately.
+    unsafe fn flush(&mut self) {
+        waveOutReset(self.hwo);
+    }
+
     unsafe fn close(&mut self) {
         waveOutReset(self.hwo);
         for b in self.bufs.iter_mut() {
@@ -1374,17 +1380,26 @@ fn audio_thread(reader: Sendable<IMFSourceReader>, sh: Arc<Shared>, af: AudioFmt
                 let peak = game.iter().map(|&x| (x as i32).abs()).max().unwrap_or(0);
                 sh.peak.store(peak as u32, Ordering::Relaxed);
 
-                // live monitor (game only, own volume)
+                // live monitor: main volume slider x the game volume from settings (0 = silent)
                 let gain = if sh.muted.load(Ordering::Relaxed) {
                     0.0
                 } else {
                     let v = sh.vol.load(Ordering::Relaxed) as f32 / 100.0;
-                    v * v
+                    v * v * (sh.game_gain.load(Ordering::Relaxed) as f32 / 100.0)
                 };
-                if gain > 0.0 && !game.is_empty() {
+                if gain <= 0.001 {
+                    if MON_PLAYING.swap(false, Ordering::Relaxed) {
+                        if let Some(m) = monitor.as_mut() {
+                            m.flush(); // clear what is already queued
+                        }
+                    }
+                } else {
+                    MON_PLAYING.store(true, Ordering::Relaxed);
+                }
+                if gain > 0.001 && !game.is_empty() {
                     pcm.clear();
                     for &x in &game {
-                        pcm.extend_from_slice(&((x as f32 * gain) as i16).to_le_bytes());
+                        pcm.extend_from_slice(&((x as f32 * gain).clamp(-32768.0, 32767.0) as i16).to_le_bytes());
                     }
                     if let Some(m) = monitor.as_mut() {
                         m.push(&pcm);
@@ -3618,7 +3633,7 @@ unsafe fn paint(hwnd: HWND) {
                 text(hdc, &format!("Glitched/dropped frames this session: {}", sh.glitches.load(Ordering::Relaxed)), &mut m2, muted_c, DT_LEFT | DT_SINGLELINE);
             }
             1 => {
-                label(hdc, 0, "Game volume", "Level of the game in recordings");
+                label(hdc, 0, "Game volume", "What you hear and what is recorded (0 = silent)");
                 step(hdc, 0, &format!("{}%", cfg.game_gain));
                 let err = sh.mic_err.lock().unwrap().clone();
                 label(hdc, 1, "Microphone", if err.is_empty() { "Mixed into the recording" } else { &err });
@@ -3640,6 +3655,13 @@ unsafe fn paint(hwnd: HWND) {
                 }
                 label(hdc, 3, "Separate mic file", "Also saves your mic alone as a .m4a next to the video");
                 toggle(hdc, 3, cfg.mic_separate);
+                SelectObject(hdc, f_small);
+                let y = panel_row(&pr, 4) + s(6);
+                let playing = MON_PLAYING.load(Ordering::Relaxed);
+                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(20) };
+                text(hdc, if playing { "Lumacap is playing the game sound through your speakers." } else { "Lumacap is not playing any game sound (volume at 0 or muted)." }, &mut m1, muted_c, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+                let mut m2 = RECT { left: pr.left + s(28), top: y + s(22), right: pr.right - s(28), bottom: y + s(64) };
+                text(hdc, "Still hear it at 0? Then it comes from outside Lumacap: the card's HDMI pass-through to your TV or monitor, or Windows 'Listen to this device' on the capture card.", &mut m2, muted_c, DT_LEFT | DT_WORDBREAK);
             }
             2 => {
                 label(hdc, 0, "Instant replay", "Starts with the app; F8 saves the last moments");
