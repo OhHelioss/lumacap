@@ -347,6 +347,7 @@ unsafe fn apply_titlebar(hwnd: HWND, light: bool) {
     let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const i32 as *const c_void, 4);
 }
 
+static LAST_FPS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HK_CAPTURE: AtomicI32 = AtomicI32::new(-1);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 static HIDDEN: AtomicBool = AtomicBool::new(false);
@@ -3885,11 +3886,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TIMER => {
             let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-            if t % 30 == 0 {
+            // measure with the real clock: WM_TIMER is low priority and can be delayed, so counting ticks over-reports fps
+            let now_ms = GetTickCount64();
+            let since = now_ms.saturating_sub(LAST_FPS_MS.load(Ordering::Relaxed));
+            if since >= 1000 {
+                LAST_FPS_MS.store(now_ms, Ordering::Relaxed);
                 let sh = &ui().sh;
                 let f = sh.frames.load(Ordering::Relaxed);
                 let last = sh.last_frames.swap(f, Ordering::Relaxed);
-                sh.fps_meas.store(f.wrapping_sub(last), Ordering::Relaxed);
+                let fps = (f.wrapping_sub(last) as u64 * 1000 + since / 2) / since;
+                sh.fps_meas.store(fps.min(u32::MAX as u64) as u32, Ordering::Relaxed);
                 maintenance();
             }
             // With the fast video path the controls only need ~10 repaints a second unless something is animating.
