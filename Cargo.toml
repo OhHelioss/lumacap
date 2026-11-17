@@ -1,6 +1,6 @@
 [package]
 name = "lumacap"
-version = "0.4.0"
+version = "0.4.1"
 description = "Lightweight, open-source capture-card recorder for Windows (Media Foundation, GPU encoding)"
 license = "MIT"
 repository = "https://github.com/OhHelioss/lumacap"

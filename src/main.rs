@@ -2457,7 +2457,7 @@ fn clipboard_text() -> Option<String> {
 
 fn tab_rows(tab: i32) -> &'static [K] {
     match tab {
-        0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick],
+        0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick, K::Change],
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
         4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle, K::Change],
@@ -3053,6 +3053,9 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                     let cur = presets.iter().position(|&p| p >= c.bitrate).unwrap_or(presets.len() - 1);
                     let next = if which == 0 { (cur + presets.len() - 1) % presets.len() } else { (cur + 1) % presets.len() };
                     c.bitrate = presets[next];
+                }
+                (0, 7) => {
+                    lib_shell(w!("open"), "https://help.elgato.com/hc/en-us/articles/360027961152", "");
                 }
                 (0, 6) => {
                     let n = sh.video_names.len();
@@ -3944,12 +3947,10 @@ unsafe fn paint(hwnd: HWND) {
                     60 => "Max",
                     _ => "Custom",
                 });
-                label(hdc, 6, "Capture card", "Takes effect after restarting Lumacap");
+                label(hdc, 6, "Capture card", &format!("Restart to apply  ·  {}  ·  {} glitched frames", MODE.lock().unwrap(), sh.glitches.load(Ordering::Relaxed)));
                 pick(hdc, 6, if cfg.video_name.is_empty() { &ui.device } else { &cfg.video_name });
-                SelectObject(hdc, f_small);
-                let y = panel_row(&pr, 7) + s(2);
-                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(20) };
-                text(hdc, &format!("{}  ·  {} glitched frames", MODE.lock().unwrap(), sh.glitches.load(Ordering::Relaxed)), &mut m1, muted_c, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+                label(hdc, 7, "Elgato drivers", "Card not detected? Opens Elgato's official driver page");
+                cycle(hdc, 7, "Open page");
             }
             1 => {
                 label(hdc, 0, "Game volume", "What you hear and what is recorded (0 = silent)");
