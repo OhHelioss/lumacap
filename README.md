@@ -43,6 +43,9 @@ Settings > Stream: pick Twitch, YouTube or Facebook (or choose Custom and type y
 ## Scene (experimental)
 Settings > Scene: zoom (100% to 300%) with pan, and a webcam overlay in any corner. Both are applied to the preview, recordings, screenshots and streams.
 
+## Supported capture cards
+Lumacap talks to the card through the standard Windows capture APIs, so it should work with Elgato's HD60 S, HD60 S+, HD60 X, 4K60 S+, 4K X, Cam Link and similar cards, and many non-Elgato cards. It looks for the card by name and otherwise lets you pick it in Settings > Video > Capture card. Settings > Scene > Capture resolution picks 720p, 1080p, 1440p or 4K when the card offers it. Only the HD60 S has been tested so far. If something looks wrong, attach `%APPDATA%\lumacap\lumacap.log` to an issue.
+
 ## Notes
 - Update check: at startup Lumacap asks GitHub for the latest release number (one request, nothing else is sent). Turn it off in Settings > System.
 - Output is MP4 only (Media Foundation has no MKV muxer).

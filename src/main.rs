@@ -116,12 +116,48 @@ unsafe fn enum_devices(audio: bool) -> R<Vec<IMFActivate>> {
     Ok(out)
 }
 
+/// Append a line to %APPDATA%\lumacap\lumacap.log (and print it). Attach this file to bug reports.
+fn log_line(s: &str) {
+    use std::io::Write;
+    static START: std::sync::Once = std::sync::Once::new();
+    let dir = std::env::var("APPDATA").map(|a| format!("{a}\\lumacap")).unwrap_or_else(|_| ".".into());
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{dir}\\lumacap.log");
+    START.call_once(|| {
+        if std::fs::metadata(&path).map(|m| m.len() > 400_000).unwrap_or(false) {
+            let _ = std::fs::remove_file(&path);
+        }
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}s] {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0), s);
+    }
+}
+
+macro_rules! logln {
+    ($($a:tt)*) => {{
+        let s = format!($($a)*);
+        println!("{}", s);
+        log_line(&s);
+    }};
+}
+
+macro_rules! elogln {
+    ($($a:tt)*) => {{
+        let s = format!($($a)*);
+        eprintln!("{}", s);
+        log_line(&s);
+    }};
+}
+
 fn pick(devs: &[IMFActivate], want: Option<usize>, needles: &[&str]) -> Option<usize> {
     if let Some(i) = want {
         return (i < devs.len()).then_some(i);
     }
     for (i, d) in devs.iter().enumerate() {
         let name = unsafe { friendly_name(d) }.to_lowercase();
+        if name.contains("facecam") || name.contains("wave") {
+            continue; // Elgato webcams and microphones are not capture cards
+        }
         if needles.iter().any(|n| name.contains(n)) {
             return Some(i);
         }
@@ -168,6 +204,7 @@ struct Settings {
     stream_key: String,
     stream_kbps: u32,
     stream_fps30: bool,
+    res: u32, // capture resolution: 0 auto (1080p), 1 720p, 2 1440p, 3 2160p
     zoom: u32, // index into scene::ZOOMS
     pan_x: u32,
     pan_y: u32,
@@ -220,6 +257,7 @@ impl Settings {
             stream_key: String::new(),
             stream_kbps: 6000,
             stream_fps30: false,
+            res: 0,
             zoom: 0,
             pan_x: 50,
             pan_y: 50,
@@ -272,6 +310,7 @@ impl Settings {
                     "stream_key" => s.stream_key = v.to_string(),
                     "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
                     "stream_fps30" => s.stream_fps30 = v == "1",
+                    "res" => s.res = v.parse().unwrap_or(0).min(3),
                     "zoom" => s.zoom = v.parse().unwrap_or(0).min(4),
                     "pan_x" => s.pan_x = v.parse().unwrap_or(50).min(100),
                     "pan_y" => s.pan_y = v.parse().unwrap_or(50).min(100),
@@ -291,7 +330,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -327,6 +366,7 @@ impl Settings {
             self.stream_key,
             self.stream_kbps,
             self.stream_fps30 as u8,
+            self.res,
             self.zoom,
             self.pan_x,
             self.pan_y,
@@ -440,7 +480,7 @@ unsafe fn register_hotkeys(hwnd: HWND, c: &Settings) {
     for (id, vk) in [(1, c.hk_rec), (2, c.hk_shot), (3, c.hk_replay), (4, c.hk_pause), (5, c.hk_mic)] {
         let _ = UnregisterHotKey(hwnd, id);
         if RegisterHotKey(hwnd, id, MOD_NOREPEAT, vk).is_err() {
-            eprintln!("{} is taken by another app; use the on-screen buttons.", vk_name(vk));
+            elogln!("{} is taken by another app; use the on-screen buttons.", vk_name(vk));
         }
     }
 }
@@ -663,7 +703,7 @@ fn post_frame_msg() {
     }
 }
 
-unsafe fn open_video(act: &IMFActivate, want_fps: u32) -> R<(IMFSourceReader, VideoFmt, bool)> {
+unsafe fn open_video(act: &IMFActivate, want_fps: u32, target_h: i64) -> R<(IMFSourceReader, VideoFmt, bool)> {
     let source: IMFMediaSource = act.ActivateObject()?;
     let mut attrs: Option<IMFAttributes> = None;
     MFCreateAttributes(&mut attrs, 3)?;
@@ -685,12 +725,12 @@ unsafe fn open_video(act: &IMFActivate, want_fps: u32) -> R<(IMFSourceReader, Vi
         let sub = mt.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
         let cc: String =
             sub.data1.to_le_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect();
-        println!("  native mode {i}: {w}x{h} @ {fps} fps  {cc}");
+        logln!("  native mode {i}: {w}x{h} @ {fps} fps  {cc}");
         if w == 0 || h == 0 {
             continue;
         }
         let mut score = 0i64;
-        score -= (1080i64 - h as i64).abs() * 10;
+        score -= (target_h - h as i64).abs() * 10;
         score -= (want_fps as i64 - fps as i64).abs() * 50;
         if sub == MFVideoFormat_NV12 {
             score += 40;
@@ -706,7 +746,7 @@ unsafe fn open_video(act: &IMFActivate, want_fps: u32) -> R<(IMFSourceReader, Vi
     let mut cpu = false;
     for (_, native, f, cc, is_yuy2) in cands {
         if let Err(e) = reader.SetCurrentMediaType(vs, None, &native) {
-            println!("  skip {}x{}@{} {cc}: select failed: {e}", f.w, f.h, f.fps);
+            logln!("  skip {}x{}@{} {cc}: select failed: {e}", f.w, f.h, f.fps);
             continue;
         }
         let out = MFCreateMediaType()?;
@@ -716,16 +756,16 @@ unsafe fn open_video(act: &IMFActivate, want_fps: u32) -> R<(IMFSourceReader, Vi
         out.SetUINT64(&MF_MT_FRAME_RATE, pack(f.fps, 1))?;
         match reader.SetCurrentMediaType(vs, None, &out) {
             Ok(()) => {
-                println!("  using {}x{}@{} {cc} -> NV12 (Windows converter)", f.w, f.h, f.fps);
+                logln!("  using {}x{}@{} {cc} -> NV12 (Windows converter)", f.w, f.h, f.fps);
                 *MODE.lock().unwrap() = format!("{}x{} @ {} fps, {} via Windows converter", f.w, f.h, f.fps, cc);
                 fmt = Some(f);
                 break;
             }
             Err(e) => {
-                println!("  {}x{}@{} {cc}: Windows NV12 convert failed: {e}", f.w, f.h, f.fps);
+                logln!("  {}x{}@{} {cc}: Windows NV12 convert failed: {e}", f.w, f.h, f.fps);
                 if is_yuy2 {
                     reader.SetCurrentMediaType(vs, None, &native)?;
-                    println!("  using {}x{}@{} YUY2 -> NV12 (own CPU converter)", f.w, f.h, f.fps);
+                    logln!("  using {}x{}@{} YUY2 -> NV12 (own CPU converter)", f.w, f.h, f.fps);
                     *MODE.lock().unwrap() = format!("{}x{} @ {} fps, YUY2 via own converter", f.w, f.h, f.fps);
                     fmt = Some(f);
                     cpu = true;
@@ -774,7 +814,7 @@ unsafe fn open_audio(act: &IMFActivate) -> R<(IMFSourceReader, AudioFmt)> {
     ];
     for f in tries {
         if reader.SetCurrentMediaType(a, None, &pcm_type(&f)?).is_ok() {
-            println!("audio format: {:?}", f);
+            logln!("audio format: {:?}", f);
             return Ok((reader, f));
         }
     }
@@ -787,7 +827,7 @@ unsafe fn open_audio(act: &IMFActivate) -> R<(IMFSourceReader, AudioFmt)> {
         bits: native.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(16),
     };
     reader.SetCurrentMediaType(a, None, &native)?;
-    println!("audio format (native): {:?}", f);
+    logln!("audio format (native): {:?}", f);
     Ok((reader, f))
 }
 
@@ -1373,11 +1413,11 @@ fn save_screenshot(nv: Vec<u8>, w: usize, h: usize, sh: &Shared) {
     })();
     match res {
         Ok(()) => {
-            println!("screenshot: {path}");
+            logln!("screenshot: {path}");
             set_toast(sh, "Screenshot saved");
         }
         Err(e) => {
-            eprintln!("screenshot failed: {e}");
+            elogln!("screenshot failed: {e}");
             set_toast(sh, "Screenshot failed");
         }
     }
@@ -1783,7 +1823,7 @@ fn save_replay(sh: Arc<Shared>) {
                 Ok(r) => r,
                 Err(e) => {
                     set_toast(&sh, "Replay failed");
-                    eprintln!("replay: {e}");
+                    elogln!("replay: {e}");
                     return;
                 }
             },
@@ -1803,7 +1843,7 @@ fn save_replay(sh: Arc<Shared>) {
         let out = format!("{}\\Lumacap_replay_{}.mp4", out_dir, timestamp_name());
         match unsafe { remux(&paths, &out) } {
             Ok(()) => {
-                println!("replay saved: {out}");
+                logln!("replay saved: {out}");
                 set_toast(&sh, "Replay saved");
                 if sh.cfg.lock().unwrap().clip_beep {
                     std::thread::spawn(|| {
@@ -1813,7 +1853,7 @@ fn save_replay(sh: Arc<Shared>) {
                 }
             }
             Err(e) => {
-                eprintln!("replay remux failed: {e}");
+                elogln!("replay remux failed: {e}");
                 set_toast(&sh, "Replay failed");
             }
         }
@@ -2247,7 +2287,7 @@ fn trim_export_start() {
                 trim_status(&format!("Saved {nm} in your recordings folder"));
             }
             Err(e) => {
-                eprintln!("trim: {e}");
+                elogln!("trim: {e}");
                 let _ = std::fs::remove_file(&out);
                 set_toast(&ui.sh, "Clip export failed");
                 trim_status(&format!("Export failed: {}", e.message()));
@@ -2456,7 +2496,7 @@ fn tab_rows(tab: i32) -> &'static [K] {
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
         4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle, K::Change],
-        5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle],
+        5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle, K::Cycle],
         _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
 }
@@ -2500,11 +2540,11 @@ fn start_recording() {
     };
     match unsafe { start_recorder(&path, &sh.fmt, c.bitrate * 1_000_000, sh.afmt.as_ref(), &opts) } {
         Ok(rec) => {
-            println!("recording: {}", path);
+            logln!("recording: {}", path);
             *sh.rec.lock().unwrap() = Some(Arc::new(rec));
         }
         Err(e) => {
-            eprintln!("could not start recording: {e}");
+            elogln!("could not start recording: {e}");
             set_toast(sh, if c.hevc { "Could not start (HEVC needs a hardware encoder)" } else { "Could not start recording" });
         }
     }
@@ -2908,7 +2948,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                         match start_replay(sh) {
                             Ok(()) => sh.cfg.lock().unwrap().replay_on = true,
                             Err(e) => {
-                                eprintln!("replay: {e}");
+                                elogln!("replay: {e}");
                                 set_toast(sh, "Could not start instant replay");
                             }
                         }
@@ -3022,6 +3062,12 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                     let mut c = sh.cfg.lock().unwrap();
                     c.cam_size = (c.cam_size + 1) % 3;
                     scene::sync(&c);
+                }
+                (5, 6) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.res = (c.res + 1) % 4;
+                    drop(c);
+                    set_toast(sh, "Restart Lumacap to apply the new resolution");
                 }
                 (4, 5) => {
                     if sh.stream.lock().unwrap().is_some() {
@@ -4016,10 +4062,12 @@ unsafe fn paint(hwnd: HWND) {
                 cycle(hdc, 4, scene::CAM_POS[(cfg.cam_pos as usize).min(3)]);
                 label(hdc, 5, "Webcam size", "Width relative to the picture");
                 cycle(hdc, 5, scene::SIZE_NAMES[(cfg.cam_size as usize).min(2)]);
+                label(hdc, 6, "Capture resolution", "Closest mode your card offers. Restart to apply");
+                cycle(hdc, 6, ["Auto (1080p)", "720p", "1440p", "4K (2160p)"][(cfg.res as usize).min(3)]);
                 SelectObject(hdc, f_small);
-                let y = panel_row(&pr, 6) + s(6);
-                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(60) };
-                text(hdc, "Zoom and webcam are experimental. Zoom 100% with the webcam off leaves the picture untouched.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
+                let y = panel_row(&pr, 7) + s(2);
+                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(40) };
+                text(hdc, "Zoom and webcam are experimental. 4K needs a card that offers it and a fast PC.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
             }
             4 => {
                 let live = sh.stream.lock().unwrap().is_some();
@@ -4485,13 +4533,13 @@ fn run() -> R<()> {
         let adevs = enum_devices(true)?;
 
         if args.iter().any(|a| a == "--list") {
-            println!("Video devices:");
+            logln!("Video devices:");
             for (i, d) in vdevs.iter().enumerate() {
-                println!("  [{i}] {}", friendly_name(d));
+                logln!("  [{i}] {}", friendly_name(d));
             }
-            println!("Audio devices:");
+            logln!("Audio devices:");
             for (i, d) in adevs.iter().enumerate() {
-                println!("  [{i}] {}", friendly_name(d));
+                logln!("  [{i}] {}", friendly_name(d));
             }
             return Ok(());
         }
@@ -4501,38 +4549,41 @@ fn run() -> R<()> {
             if n.is_empty() { None } else { vdevs.iter().position(|d| friendly_name(d) == n) }
         };
         let want_v = arg(&args, "--video").and_then(|s| s.parse().ok()).or(saved_v);
-        let vi = pick(&vdevs, want_v, &["hd60", "elgato", "game capture"]).or(if vdevs.is_empty() { None } else { Some(0) });
+        let vi = pick(&vdevs, want_v, &["hd60", "4k60", "4k x", "4k s", "game capture", "cam link"]).or_else(|| pick(&vdevs, None, &["elgato"])).or(if vdevs.is_empty() { None } else { Some(0) });
         let Some(vi) = vi else {
             msgbox("No video capture device found. Is the HD60 S plugged into a USB 3.0 port?");
             return Ok(());
         };
         let device = friendly_name(&vdevs[vi]);
-        println!("video: {device}");
+        logln!("Lumacap {} starting", env!("CARGO_PKG_VERSION"));
+        logln!("video devices: {}", vdevs.iter().map(|d| friendly_name(d)).collect::<Vec<_>>().join(" | "));
+        logln!("audio devices: {}", adevs.iter().map(|d| friendly_name(d)).collect::<Vec<_>>().join(" | "));
+        logln!("video: {device}");
 
-        let (vreader, fmt, yuy2) = open_video(&vdevs[vi], arg(&args, "--fps").and_then(|s| s.parse().ok()).unwrap_or(60))?;
-        println!("mode: {}x{} @ {} fps", fmt.w, fmt.h, fmt.fps);
+        let (vreader, fmt, yuy2) = open_video(&vdevs[vi], arg(&args, "--fps").and_then(|s| s.parse().ok()).unwrap_or(60), [1080i64, 720, 1440, 2160][Settings::load().res.min(3) as usize])?;
+        logln!("mode: {}x{} @ {} fps", fmt.w, fmt.h, fmt.fps);
 
         let no_audio = arg(&args, "--audio").as_deref() == Some("none");
         let want_a = arg(&args, "--audio").and_then(|s| s.parse().ok());
-        let ai = if no_audio { None } else { pick(&adevs, want_a, &["hd60", "elgato", "digital audio interface"]) };
+        let ai = if no_audio { None } else { pick(&adevs, want_a, &["hd60", "4k60", "4k x", "4k s", "game capture", "cam link", "digital audio interface"]).or_else(|| pick(&adevs, None, &["elgato"])) };
         let mut audio_name = String::new();
         let mut audio_note = String::new();
         let mut audio: Option<(IMFSourceReader, AudioFmt)> = None;
         match ai {
             Some(i) => {
                 audio_name = friendly_name(&adevs[i]);
-                println!("audio: {audio_name}");
+                logln!("audio: {audio_name}");
                 match open_audio(&adevs[i]) {
                     Ok(r) => audio = Some(r),
                     Err(e) => {
                         audio_note = format!("audio error: {}", e.message());
-                        eprintln!("{audio_note}");
+                        elogln!("{audio_note}");
                     }
                 }
             }
             None => {
                 audio_note = String::from("no audio device found");
-                println!("audio: none found (use --audio N, see --list)");
+                logln!("audio: none found (use --audio N, see --list)");
             }
         }
 
@@ -4675,7 +4726,7 @@ fn run() -> R<()> {
         start_watchdog(sh.clone());
         if cfg.replay_on {
             if let Err(e) = start_replay(&sh) {
-                eprintln!("instant replay: {e}");
+                elogln!("instant replay: {e}");
                 sh.cfg.lock().unwrap().replay_on = false;
             }
         }
