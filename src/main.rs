@@ -10,6 +10,7 @@ mod h264;
 mod rtmp;
 mod scene;
 mod stream;
+mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
@@ -40,7 +41,6 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount64};
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::Networking::WinHttp::{WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_FLAG_SECURE};
 use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows::Win32::System::Registry::{RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ};
 use windows::Win32::UI::Shell::{
@@ -198,7 +198,7 @@ struct Settings {
     autostart: bool,
     hk_mic: u32,
     video_name: String,
-    update_check: bool,
+    update_mode: u8, // 0 off, 1 notify, 2 auto-install
     stream_server: u32, // 0 Twitch, 1 YouTube, 2 custom, 3 Facebook
     stream_custom: String,
     stream_key: String,
@@ -251,7 +251,7 @@ impl Settings {
             autostart: false,
             hk_mic: 0x7B,
             video_name: String::new(),
-            update_check: true,
+            update_mode: 1,
             stream_server: 0,
             stream_custom: String::new(),
             stream_key: String::new(),
@@ -304,7 +304,8 @@ impl Settings {
                     "autostart" => s.autostart = v == "1",
                     "hk_mic" => s.hk_mic = v.parse().unwrap_or(s.hk_mic),
                     "video_name" => s.video_name = v.to_string(),
-                    "update_check" => s.update_check = v != "0",
+                    "update_check" => s.update_mode = if v == "0" { 0 } else { 1 },
+                    "update_mode" => s.update_mode = v.parse::<u8>().unwrap_or(1).min(2),
                     "stream_server" => s.stream_server = v.parse().unwrap_or(0).min(3),
                     "stream_custom" => s.stream_custom = v.to_string(),
                     "stream_key" => s.stream_key = v.to_string(),
@@ -330,7 +331,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_check={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -360,7 +361,7 @@ impl Settings {
             self.autostart as u8,
             self.hk_mic,
             self.video_name,
-            self.update_check as u8,
+            self.update_mode,
             self.stream_server,
             self.stream_custom,
             self.stream_key,
@@ -517,42 +518,6 @@ unsafe fn set_hotkey(hwnd: HWND, idx: i32, vk: u32) {
 }
 
 /// Latest release tag from GitHub (e.g. "v0.1.3"), or None when offline.
-fn latest_release_tag() -> Option<String> {
-    unsafe {
-        let session = WinHttpOpen(w!("lumacap"), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, PCWSTR::null(), PCWSTR::null(), 0);
-        if session.is_null() {
-            return None;
-        }
-        let mut body = Vec::new();
-        let connect = WinHttpConnect(session, w!("api.github.com"), 443, 0);
-        if !connect.is_null() {
-            let req = WinHttpOpenRequest(connect, w!("GET"), w!("/repos/OhHelioss/lumacap/releases/latest"), PCWSTR::null(), PCWSTR::null(), std::ptr::null(), WINHTTP_FLAG_SECURE);
-            if !req.is_null() {
-                if WinHttpSendRequest(req, None, None, 0, 0, 0).is_ok() && WinHttpReceiveResponse(req, std::ptr::null_mut()).is_ok() {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        let mut got = 0u32;
-                        if WinHttpReadData(req, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut got).is_err() || got == 0 {
-                            break;
-                        }
-                        body.extend_from_slice(&buf[..got as usize]);
-                        if body.len() > 256 * 1024 {
-                            break;
-                        }
-                    }
-                }
-                let _ = WinHttpCloseHandle(req);
-            }
-            let _ = WinHttpCloseHandle(connect);
-        }
-        let _ = WinHttpCloseHandle(session);
-        let text = String::from_utf8_lossy(&body).to_string();
-        let key = "\"tag_name\":\"";
-        let i = text.find(key)? + key.len();
-        let j = text[i..].find('"')?;
-        Some(text[i..i + j].to_string())
-    }
-}
 
 fn version_tuple(v: &str) -> Vec<u32> {
     v.trim_start_matches('v').split('.').map(|p| p.parse().unwrap_or(0)).collect()
@@ -2998,7 +2963,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 }
                 (3, 7) => {
                     let mut c = sh.cfg.lock().unwrap();
-                    c.update_check = !c.update_check;
+                    c.update_mode = (c.update_mode + 1) % 3;
                 }
                 (4, 0) => {
                     let mut c = sh.cfg.lock().unwrap();
@@ -4105,8 +4070,8 @@ unsafe fn paint(hwnd: HWND) {
                 toggle(hdc, 5, cfg.tray);
                 label(hdc, 6, "Start with Windows", "Starts hidden in the tray, ready for instant replay");
                 toggle(hdc, 6, cfg.autostart);
-                label(hdc, 7, "Check for updates", "Asks GitHub for the latest version at startup; nothing else is sent");
-                toggle(hdc, 7, cfg.update_check);
+                label(hdc, 7, "Updates", "Only GitHub is contacted. Auto installs after checking the release's SHA-256");
+                cycle(hdc, 7, ["Off", "Notify only", "Auto-install"][cfg.update_mode.min(2) as usize]);
             }
         }
     }
@@ -4656,14 +4621,36 @@ fn run() -> R<()> {
             let dev = ui().device.clone();
             scene::set_cam(&cfg.cam_name, &dev);
         }
-        if cfg.update_check {
+        update::cleanup_old();
+        if cfg.update_mode > 0 {
             let sh_u = sh.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(6));
-                if let Some(tag) = latest_release_tag() {
-                    if version_tuple(&tag) > version_tuple(env!("CARGO_PKG_VERSION")) {
-                        set_toast(&sh_u, &format!("Update available: {tag} (github.com/OhHelioss/lumacap/releases)"));
+                loop {
+                    let mode = sh_u.cfg.lock().unwrap().update_mode;
+                    if mode > 0 {
+                        if let Some(rel) = update::fetch_latest() {
+                            if version_tuple(&rel.tag) > version_tuple(env!("CARGO_PKG_VERSION")) {
+                                if mode == 2 {
+                                    match update::install(&rel) {
+                                        Ok(()) => {
+                                            logln!("updated to {}", rel.tag);
+                                            set_toast(&sh_u, &format!("Updated to {}. Restart Lumacap to use it", rel.tag));
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            elogln!("auto-update failed: {e}");
+                                            set_toast(&sh_u, &format!("Update {} available, auto-install failed: {e}", rel.tag));
+                                        }
+                                    }
+                                } else {
+                                    set_toast(&sh_u, &format!("Update available: {} (github.com/OhHelioss/lumacap/releases)", rel.tag));
+                                }
+                                return;
+                            }
+                        }
                     }
+                    std::thread::sleep(Duration::from_secs(12 * 3600));
                 }
             });
         }
