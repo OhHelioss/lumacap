@@ -823,6 +823,15 @@ struct Recorder {
     m_skip: AtomicI64,
     half: bool, // 30 fps output from a 60 fps capture
     fcount: AtomicU32,
+    // diagnostics for lumacap.log
+    d_frames: AtomicU32,
+    d_errs: AtomicU32,
+    d_gaps: AtomicU32,    // frame gaps over 50 ms
+    d_maxgap_us: AtomicI64,
+    d_maxwrite_us: AtomicI64,
+    d_prev_ts: AtomicI64,
+    d_last_t: AtomicI64,
+    d_first_err: Mutex<String>,
     path: String,
     started: Instant,
 }
@@ -940,6 +949,14 @@ unsafe fn start_recorder(path: &str, f: &VideoFmt, bitrate_bps: u32, afmt: Optio
         m_skip: AtomicI64::new(0),
         half: o.half,
         fcount: AtomicU32::new(0),
+        d_frames: AtomicU32::new(0),
+        d_errs: AtomicU32::new(0),
+        d_gaps: AtomicU32::new(0),
+        d_maxgap_us: AtomicI64::new(0),
+        d_maxwrite_us: AtomicI64::new(0),
+        d_prev_ts: AtomicI64::new(-1),
+        d_last_t: AtomicI64::new(0),
+        d_first_err: Mutex::new(String::new()),
         path: path.to_string(),
         started: Instant::now(),
     })
@@ -955,7 +972,22 @@ fn finalize_when_free(rec: Arc<Recorder>) -> std::thread::JoinHandle<()> {
             std::thread::sleep(Duration::from_millis(20));
         }
         unsafe {
-            let _ = rec.writer.0.Finalize();
+            let fin = rec.writer.0.Finalize();
+            let wall = rec.started.elapsed().as_secs_f64().max(0.001);
+            let fr = rec.d_frames.load(Ordering::Relaxed);
+            if !rec.path.contains("\\seg_") { logln!(
+                "recording stats: {} frames in {:.1}s wall ({:.1} fps), video ends at {:.1}s, max capture gap {} ms, gaps over 50 ms: {}, slowest WriteSample {} ms, write errors: {}{}, finalize: {:?}",
+                fr,
+                wall,
+                fr as f64 / wall,
+                rec.d_last_t.load(Ordering::Relaxed) as f64 / 1e7,
+                rec.d_maxgap_us.load(Ordering::Relaxed) / 1000,
+                rec.d_gaps.load(Ordering::Relaxed),
+                rec.d_maxwrite_us.load(Ordering::Relaxed) / 1000,
+                rec.d_errs.load(Ordering::Relaxed),
+                { let e = rec.d_first_err.lock().unwrap(); if e.is_empty() { String::new() } else { format!(" (first: {})", *e) } },
+                fin.is_ok()
+            ); }
             if let Some((mw, _)) = &rec.mic {
                 let _ = mw.0.Finalize();
             }
@@ -1054,7 +1086,33 @@ fn write_video(rec: &Recorder, sample: &IMFSample, ts: i64) {
         }
         rec.v_last_end.store(ts + dur, Ordering::SeqCst);
         let _ = sample.SetSampleTime(t);
-        let _ = rec.writer.0.WriteSample(rec.video_idx, sample);
+        let t0 = Instant::now();
+        let res = rec.writer.0.WriteSample(rec.video_idx, sample);
+        let wus = t0.elapsed().as_micros() as i64;
+        if wus > rec.d_maxwrite_us.load(Ordering::Relaxed) {
+            rec.d_maxwrite_us.store(wus, Ordering::Relaxed);
+        }
+        let prev = rec.d_prev_ts.swap(ts, Ordering::Relaxed);
+        if prev >= 0 {
+            let gap = (ts - prev) / 10; // 100 ns -> us
+            if gap > rec.d_maxgap_us.load(Ordering::Relaxed) {
+                rec.d_maxgap_us.store(gap, Ordering::Relaxed);
+            }
+            if gap > 50_000 {
+                rec.d_gaps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        rec.d_last_t.store(t, Ordering::Relaxed);
+        match res {
+            Ok(()) => {
+                rec.d_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                if rec.d_errs.fetch_add(1, Ordering::Relaxed) == 0 {
+                    *rec.d_first_err.lock().unwrap() = e.to_string();
+                }
+            }
+        }
     }
 }
 
