@@ -204,6 +204,7 @@ struct Settings {
     stream_key: String,
     stream_kbps: u32,
     stream_fps30: bool,
+    stream_vertical: u32, // 0 landscape, 1 vertical 720x1280, 2 vertical 1080x1920
     stream_enc: u32, // 0 auto (software first), 1 software, 2 GPU
     svc_keys: [String; 4], // saved stream key per service (indexed by service number)
     svc_kbps: [u32; 4],
@@ -260,6 +261,7 @@ impl Settings {
             stream_key: String::new(),
             stream_kbps: 6000,
             stream_fps30: false,
+            stream_vertical: 0,
             stream_enc: 0,
             svc_keys: Default::default(),
             svc_kbps: [0; 4],
@@ -317,6 +319,7 @@ impl Settings {
                     "stream_key" => s.stream_key = v.to_string(),
                     "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
                     "stream_fps30" => s.stream_fps30 = v == "1",
+                    "stream_vertical" => s.stream_vertical = v.parse().unwrap_or(0).min(2),
                     "stream_enc" => s.stream_enc = v.parse().unwrap_or(0).min(2),
                     "svc_key0" => s.svc_keys[0] = v.to_string(),
                     "svc_key1" => s.svc_keys[1] = v.to_string(),
@@ -346,7 +349,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nstream_vertical={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -390,6 +393,7 @@ impl Settings {
             self.cam_pos,
             self.cam_size,
             self.stream_enc,
+            self.stream_vertical,
             self.svc_keys[0],
             self.svc_keys[1],
             self.svc_keys[2],
@@ -2721,7 +2725,7 @@ fn tab_rows(tab: i32) -> &'static [K] {
         0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick, K::Change],
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
-        4 => &[K::Cycle, K::Dual, K::Dual, K::Step, K::Cycle, K::Toggle, K::Change, K::Cycle],
+        4 => &[K::Cycle, K::Dual, K::Dual, K::Step, K::Cycle, K::Toggle, K::Change, K::Cycle, K::Cycle],
         5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle, K::Cycle],
         _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
@@ -3282,6 +3286,10 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                     c.stream_fps30 = !c.stream_fps30;
                 }
                 (4, 6) => stream::test_connection(),
+                (4, 8) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.stream_vertical = (c.stream_vertical + 1) % 3;
+                }
                 (4, 7) => {
                     let mut c = sh.cfg.lock().unwrap();
                     c.stream_enc = (c.stream_enc + 1) % 3;
@@ -4372,9 +4380,8 @@ unsafe fn paint(hwnd: HWND) {
                 SelectObject(hdc, f_norm);
                 label(hdc, 7, "Video encoder", match cfg.stream_enc { 1 => "Software only: works everywhere, uses more CPU", 2 => "GPU only: light on the CPU, but some AMD cards give a green picture", _ => "Auto: tries software first, then the GPU" });
                 cycle(hdc, 7, match cfg.stream_enc { 1 => "Software", 2 => "GPU", _ => "Auto" });
-                let y = panel_row(&pr, 8) + s(2);
-                let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(40) };
-                text(hdc, "Your key is stored on this PC only (settings.ini) and is sent to nothing but the server above. Keep it private.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
+                label(hdc, 8, "Orientation", match cfg.stream_vertical { 1 => "Vertical 9:16 for TikTok: the middle of the picture at 720x1280", 2 => "Vertical 9:16 at 1080x1920 (full HD). Runs at 30 fps, needs a strong PC", _ => "Landscape: streams the whole picture" });
+                cycle(hdc, 8, match cfg.stream_vertical { 1 => "Vertical 720p", 2 => "Vertical 1080p", _ => "Landscape" });
             }
             _ => {
                 let names = ["Record / stop", "Screenshot", "Save replay", "Pause / resume", "Mute microphone"];

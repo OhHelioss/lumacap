@@ -32,6 +32,9 @@ struct Params {
     fps: u32,
     audio_rate: Option<u32>,
     enc: u32,
+    src_w: u32,
+    src_h: u32,
+    vertical: u32,
 }
 
 fn set_status(ctl: &StreamCtl, s: &str) {
@@ -206,7 +209,7 @@ pub fn go_live() {
         set_toast(sh, "Paste your stream key first (Settings > Stream)");
         return;
     }
-    let half = c.stream_fps30 && sh.fmt.fps >= 50;
+    let half = (c.stream_fps30 || c.stream_vertical == 2) && sh.fmt.fps >= 50;
     let (tx_v, rx_v) = sync_channel(4);
     let (tx_a, rx_a) = sync_channel(64);
     let ctl = Arc::new(StreamCtl {
@@ -228,8 +231,11 @@ pub fn go_live() {
         url,
         key: c.stream_key.trim().to_string(),
         kbps: c.stream_kbps.clamp(500, 20000),
-        w: sh.fmt.w,
-        h: sh.fmt.h,
+        w: match c.stream_vertical { 1 => 720, 2 => 1080, _ => sh.fmt.w },
+        h: match c.stream_vertical { 1 => 1280, 2 => 1920, _ => sh.fmt.h },
+        src_w: sh.fmt.w,
+        src_h: sh.fmt.h,
+        vertical: c.stream_vertical,
         fps: if half { (sh.fmt.fps / 2).max(1) } else { sh.fmt.fps.max(1) },
         audio_rate,
         enc: c.stream_enc,
@@ -630,7 +636,7 @@ impl Run {
                 while self.need_input > 0 {
                     let Ok(f) = rx_v.try_recv() else { break };
                     busy = true;
-                    if let Some(c) = dup_sample(&f.0) {
+                    if let Some(c) = prep_sample(&f.0, p) {
                         let _ = c.SetSampleTime(start.elapsed().as_nanos() as i64 / 100);
                         let _ = c.SetSampleDuration(frame_dur);
                         if self.venc.mft.ProcessInput(0, &c, 0).is_ok() {
@@ -642,7 +648,7 @@ impl Run {
                 // synchronous (software) encoder
                 while let Ok(f) = rx_v.try_recv() {
                     busy = true;
-                    if let Some(c) = dup_sample(&f.0) {
+                    if let Some(c) = prep_sample(&f.0, p) {
                         let _ = c.SetSampleTime(start.elapsed().as_nanos() as i64 / 100);
                         let _ = c.SetSampleDuration(frame_dur);
                         if self.venc.mft.ProcessInput(0, &c, 0).is_ok() {
@@ -675,5 +681,75 @@ impl Run {
         }
         let _ = self.venc.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         Ok(())
+    }
+}
+
+/// Sample for the encoder: a plain copy, or in vertical mode the middle 9:16 slice of the picture scaled to the output size.
+unsafe fn prep_sample(src: &IMFSample, p: &Params) -> Option<IMFSample> {
+    if p.vertical == 0 {
+        return dup_sample(src);
+    }
+    let (sw, sh_, ow, oh) = (p.src_w as usize, p.src_h as usize, p.w as usize, p.h as usize);
+    let buf = src.ConvertToContiguousBuffer().ok()?;
+    let mut ip: *mut u8 = std::ptr::null_mut();
+    let mut len = 0u32;
+    buf.Lock(&mut ip, None, Some(&mut len)).ok()?;
+    let mut result = None;
+    if !ip.is_null() && len as usize >= sw * sh_ * 3 / 2 {
+        let sdat = std::slice::from_raw_parts(ip, sw * sh_ * 3 / 2);
+        let out_len = ow * oh * 3 / 2;
+        if let Ok(ob) = MFCreateMemoryBuffer(out_len as u32) {
+            let mut op: *mut u8 = std::ptr::null_mut();
+            if ob.Lock(&mut op, None, None).is_ok() {
+                let d = std::slice::from_raw_parts_mut(op, out_len);
+                crop_scale_nv12(sdat, sw, sh_, d, ow, oh);
+                let _ = ob.Unlock();
+                let _ = ob.SetCurrentLength(out_len as u32);
+                if let Ok(os) = MFCreateSample() {
+                    if os.AddBuffer(&ob).is_ok() {
+                        let _ = os.SetSampleTime(src.GetSampleTime().unwrap_or(0));
+                        let _ = os.SetSampleDuration(src.GetSampleDuration().unwrap_or(0));
+                        result = Some(os);
+                    }
+                }
+            }
+        }
+    }
+    let _ = buf.Unlock();
+    result
+}
+
+/// Centre-crops an NV12 frame to 9:16 and scales it to `ow` x `oh` (Y bilinear, chroma nearest).
+fn crop_scale_nv12(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], ow: usize, oh: usize) {
+    let cw = ((sh * 9 / 16) & !1).min(sw).max(2);
+    let cx = ((sw - cw) / 2) & !1;
+    let (dy, duv) = dst.split_at_mut(ow * oh);
+    // fixed point 16.16 step per output pixel
+    let xs = (((cw - 1) as u64) << 16) / (ow.max(2) - 1) as u64;
+    let ys = ((((sh - 1) as u64) << 16) / (oh.max(2) - 1) as u64) as usize;
+    let xmap: Vec<(usize, u32)> = (0..ow).map(|x| { let f = x as u64 * xs; (cx + (f >> 16) as usize, ((f >> 8) & 0xff) as u32) }).collect();
+    for y in 0..oh {
+        let f = y * ys;
+        let (y0, fy) = (f >> 16, ((f >> 8) & 0xff) as u32);
+        let y1 = (y0 + 1).min(sh - 1);
+        let (r0, r1) = (&src[y0 * sw..(y0 + 1) * sw], &src[y1 * sw..(y1 + 1) * sw]);
+        let row = &mut dy[y * ow..(y + 1) * ow];
+        for (o, &(x0, fx)) in row.iter_mut().zip(&xmap) {
+            let x1 = (x0 + 1).min(sw - 1);
+            let top = r0[x0] as u32 * (256 - fx) + r0[x1] as u32 * fx;
+            let bot = r1[x0] as u32 * (256 - fx) + r1[x1] as u32 * fx;
+            *o = ((top * (256 - fy) + bot * fy) >> 16) as u8;
+        }
+    }
+    let uv = &src[sw * sh..];
+    for y in 0..oh / 2 {
+        let sy = ((y * 2) * ys >> 16) / 2;
+        let srow = &uv[sy.min(sh / 2 - 1) * sw..];
+        let row = &mut duv[y * ow..(y + 1) * ow];
+        for (px, o) in row.chunks_exact_mut(2).enumerate() {
+            let sx = (xmap[px * 2].0 & !1).min(sw - 2);
+            o[0] = srow[sx];
+            o[1] = srow[sx + 1];
+        }
     }
 }

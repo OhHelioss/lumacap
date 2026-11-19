@@ -35,6 +35,8 @@ Windows SmartScreen may warn because the files are not code-signed: choose *More
 2. In Lumacap open Settings > Stream, set Service to **Custom server**, then click **Paste** next to Server address and next to Stream key (copy each from TikTok first).
 3. Click **Go live** in Lumacap. TikTok keys are single-use: get a fresh URL and key for every live, and always use the pair TikTok showed together.
 
+For a vertical live, set **Orientation** to *Vertical 720p* or *Vertical 1080p*: Lumacap streams the middle 9:16 slice of the picture (1080p runs at 30 fps and needs a strong PC).
+
 If the picture is green, set **Video encoder** to *Software*.
 
 ## Build it yourself
