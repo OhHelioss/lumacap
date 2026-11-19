@@ -34,6 +34,10 @@ struct Params {
 }
 
 fn set_status(ctl: &StreamCtl, s: &str) {
+    // the per-second "Live ... kbps" updates would flood the log; everything else is worth keeping
+    if !s.contains(" kbps") {
+        crate::log_line(&format!("stream: {s}"));
+    }
     if let Ok(mut g) = ctl.status.lock() {
         *g = s.to_string();
     }
@@ -123,7 +127,10 @@ pub fn test_connection() {
                 p.close();
                 set_toast(&sh, "Connection OK: the server accepted your stream key");
             }
-            Err(e) => set_toast(&sh, &format!("Test failed: {e}")),
+            Err(e) => {
+                crate::log_line(&format!("stream test failed: {e}"));
+                set_toast(&sh, &format!("Test failed: {e}"));
+            }
         }
     });
 }

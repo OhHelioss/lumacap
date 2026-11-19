@@ -337,6 +337,7 @@ impl Publisher {
 
     pub(crate) fn connect_with(url: &str, key: &str, roots: rustls::RootCertStore) -> Res<Publisher> {
         let (host, port, app, secure) = parse_url(url)?;
+        crate::log_line(&format!("stream: connecting to {}://{}:{} app \"{}\", key {} chars", if secure { "rtmps" } else { "rtmp" }, host, port, app, key.chars().count()));
         let addr = if secure {
             let lp = tls_relay(&host, port, roots)?;
             std::net::SocketAddr::from(([127, 0, 0, 1], lp))
@@ -394,6 +395,7 @@ impl Publisher {
         amf_obj_end(&mut p);
         lock(&w)?.send_msg(CSID_CMD, 0, 20, 0, &p)?;
         wait_for(&mut reader, &w, |m| m.kind == 20 && amf_first_string(&m.payload).as_deref() == Some("_result"), "connect")?;
+        crate::log_line("stream: server accepted connect");
 
         // releaseStream / FCPublish / createStream
         let mut p = Vec::new();
@@ -426,6 +428,7 @@ impl Publisher {
         lock(&w)?.send_msg(CSID_CMD, 0, 20, stream_id, &p)?;
         let st = wait_for(&mut reader, &w, |m| m.kind == 20 && amf_first_string(&m.payload).as_deref() == Some("onStatus"), "publish")?;
         let codes = amf_all_strings(&st.payload);
+        crate::log_line(&format!("stream: publish answer: {}", codes.join(" | ")));
         if !codes.iter().any(|c| c == "NetStream.Publish.Start") {
             let why = codes.iter().find(|c| c.starts_with("NetStream.")).cloned().unwrap_or_else(|| "the server refused the stream".into());
             return Err(format!("publish failed: {why} (check the stream key)"));

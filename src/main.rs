@@ -117,7 +117,7 @@ unsafe fn enum_devices(audio: bool) -> R<Vec<IMFActivate>> {
 }
 
 /// Append a line to %APPDATA%\lumacap\lumacap.log (and print it). Attach this file to bug reports.
-fn log_line(s: &str) {
+pub(crate) fn log_line(s: &str) {
     use std::io::Write;
     static START: std::sync::Once = std::sync::Once::new();
     let dir = std::env::var("APPDATA").map(|a| format!("{a}\\lumacap")).unwrap_or_else(|_| ".".into());
