@@ -204,6 +204,7 @@ struct Settings {
     stream_key: String,
     stream_kbps: u32,
     stream_fps30: bool,
+    stream_fpsmode: u32, // 0 auto (30 with the software encoder), 1 always 30, 2 always source rate
     stream_vertical: u32, // 0 landscape, 1 vertical 720x1280, 2 vertical 1080x1920
     stream_enc: u32, // 0 auto (software first), 1 software, 2 GPU
     svc_keys: [String; 4], // saved stream key per service (indexed by service number)
@@ -261,6 +262,7 @@ impl Settings {
             stream_key: String::new(),
             stream_kbps: 6000,
             stream_fps30: false,
+            stream_fpsmode: 0,
             stream_vertical: 0,
             stream_enc: 0,
             svc_keys: Default::default(),
@@ -319,6 +321,7 @@ impl Settings {
                     "stream_key" => s.stream_key = v.to_string(),
                     "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
                     "stream_fps30" => s.stream_fps30 = v == "1",
+                    "stream_fpsmode" => s.stream_fpsmode = v.parse().unwrap_or(0).min(2),
                     "stream_vertical" => s.stream_vertical = v.parse().unwrap_or(0).min(2),
                     "stream_enc" => s.stream_enc = v.parse().unwrap_or(0).min(2),
                     "svc_key0" => s.svc_keys[0] = v.to_string(),
@@ -349,7 +352,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nstream_vertical={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nstream_vertical={}\nstream_fpsmode={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -394,6 +397,7 @@ impl Settings {
             self.cam_size,
             self.stream_enc,
             self.stream_vertical,
+            self.stream_fpsmode,
             self.svc_keys[0],
             self.svc_keys[1],
             self.svc_keys[2],
@@ -3283,7 +3287,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 }
                 (4, 4) => {
                     let mut c = sh.cfg.lock().unwrap();
-                    c.stream_fps30 = !c.stream_fps30;
+                    c.stream_fpsmode = if which == 0 { (c.stream_fpsmode + 2) % 3 } else { (c.stream_fpsmode + 1) % 3 };
                 }
                 (4, 6) => stream::test_connection(),
                 (4, 8) => {
@@ -4370,8 +4374,8 @@ unsafe fn paint(hwnd: HWND) {
                 small_btn(hdc, id_a(2) + 1, "Paste");
                 label(hdc, 3, "Stream bitrate", stream::bitrate_hint(&cfg));
                 step(hdc, 3, &format!("{} kbps", cfg.stream_kbps));
-                label(hdc, 4, "Frame rate", "30 fps uses less upload bandwidth");
-                cycle(hdc, 4, if cfg.stream_fps30 { "30 fps" } else { "Source" });
+                label(hdc, 4, "Frame rate", match cfg.stream_fpsmode { 1 => "Always 30 fps: smoothest on a busy PC", 2 => "Always the capture rate (60 fps): needs the GPU encoder or a fast CPU", _ => "Auto: 30 fps with the software encoder, 60 fps with the GPU encoder" });
+                cycle(hdc, 4, match cfg.stream_fpsmode { 1 => "30 fps", 2 => "Source", _ => "Auto" });
                 label(hdc, 5, "Go live", &if live { stream::status_text().unwrap_or_default() } else { "Streams what you see in the preview".to_string() });
                 toggle(hdc, 5, live);
                 SelectObject(hdc, f_small);

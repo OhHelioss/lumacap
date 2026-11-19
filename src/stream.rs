@@ -209,7 +209,12 @@ pub fn go_live() {
         set_toast(sh, "Paste your stream key first (Settings > Stream)");
         return;
     }
-    let half = (c.stream_fps30 || c.stream_vertical == 2) && sh.fmt.fps >= 50;
+    let half = sh.fmt.fps >= 50
+        && match c.stream_fpsmode {
+            1 => true,
+            2 => false,
+            _ => c.stream_enc != 2 || c.stream_vertical == 2,
+        };
     let (tx_v, rx_v) = sync_channel(4);
     let (tx_a, rx_a) = sync_channel(64);
     let ctl = Arc::new(StreamCtl {
@@ -321,6 +326,7 @@ unsafe fn configure_video(act: &IMFActivate, w: u32, h: u32, fps: u32, kbps: u32
         set_codec_u32(&api, &CODECAPI_AVEncMPVGOPSize, fps * 2); // keyframe every 2 s, what Twitch/YouTube expect
         set_codec_u32(&api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         set_codec_u32(&api, &CODECAPI_AVLowLatencyMode, 1);
+        set_codec_u32(&api, &CODECAPI_AVEncCommonQualityVsSpeed, 20); // favour speed so a busy CPU keeps up
     }
     let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
