@@ -205,6 +205,7 @@ struct Settings {
     stream_kbps: u32,
     stream_fps30: bool,
     stream_fpsmode: u32, // 0 auto (30 with the software encoder), 1 always 30, 2 always source rate
+    stream_vframe: u32, // vertical framing: 0 fill (crop), 1 fit (bars), 2 square
     stream_vertical: u32, // 0 landscape, 1 vertical 720x1280, 2 vertical 1080x1920
     stream_enc: u32, // 0 auto (software first), 1 software, 2 GPU
     svc_keys: [String; 4], // saved stream key per service (indexed by service number)
@@ -263,6 +264,7 @@ impl Settings {
             stream_kbps: 6000,
             stream_fps30: false,
             stream_fpsmode: 0,
+            stream_vframe: 1,
             stream_vertical: 0,
             stream_enc: 0,
             svc_keys: Default::default(),
@@ -322,6 +324,7 @@ impl Settings {
                     "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
                     "stream_fps30" => s.stream_fps30 = v == "1",
                     "stream_fpsmode" => s.stream_fpsmode = v.parse().unwrap_or(0).min(2),
+                    "stream_vframe" => s.stream_vframe = v.parse().unwrap_or(1).min(2),
                     "stream_vertical" => s.stream_vertical = v.parse().unwrap_or(0).min(2),
                     "stream_enc" => s.stream_enc = v.parse().unwrap_or(0).min(2),
                     "svc_key0" => s.svc_keys[0] = v.to_string(),
@@ -352,7 +355,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nstream_vertical={}\nstream_fpsmode={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nstream_vertical={}\nstream_fpsmode={}\nstream_vframe={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -398,6 +401,7 @@ impl Settings {
             self.stream_enc,
             self.stream_vertical,
             self.stream_fpsmode,
+            self.stream_vframe,
             self.svc_keys[0],
             self.svc_keys[1],
             self.svc_keys[2],
@@ -2729,7 +2733,7 @@ fn tab_rows(tab: i32) -> &'static [K] {
         0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick, K::Change],
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
-        4 => &[K::Cycle, K::Dual, K::Dual, K::Step, K::Cycle, K::Toggle, K::Change, K::Cycle, K::Cycle],
+        4 => &[K::Cycle, K::Dual, K::Dual, K::Step, K::Cycle, K::Toggle, K::Change, K::Cycle, K::Cycle, K::Cycle],
         5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle, K::Cycle],
         _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
@@ -2891,7 +2895,7 @@ unsafe fn apply_topmost(hwnd: HWND, on: bool) {
 // ---------- controls / layout ----------
 
 fn panel_rect(rc: &RECT) -> RECT {
-    let (pw, ph) = (s(620).min(rc.right - 20), s(if TAB.load(Ordering::Relaxed) == 4 { 600 } else { 540 }).min(rc.bottom - 20));
+    let (pw, ph) = (s(620).min(rc.right - 20), s(if TAB.load(Ordering::Relaxed) == 4 { 656 } else { 540 }).min(rc.bottom - 20));
     let (x, y) = ((rc.right - pw) / 2, (rc.bottom - ph) / 2);
     RECT { left: x, top: y, right: x + pw, bottom: y + ph }
 }
@@ -3290,6 +3294,10 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                     c.stream_fpsmode = if which == 0 { (c.stream_fpsmode + 2) % 3 } else { (c.stream_fpsmode + 1) % 3 };
                 }
                 (4, 6) => stream::test_connection(),
+                (4, 9) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.stream_vframe = (c.stream_vframe + 1) % 3;
+                }
                 (4, 8) => {
                     let mut c = sh.cfg.lock().unwrap();
                     c.stream_vertical = (c.stream_vertical + 1) % 3;
@@ -4386,6 +4394,8 @@ unsafe fn paint(hwnd: HWND) {
                 cycle(hdc, 7, match cfg.stream_enc { 1 => "Software", 2 => "GPU", _ => "Auto" });
                 label(hdc, 8, "Orientation", match cfg.stream_vertical { 1 => "Vertical 9:16 for TikTok: the middle of the picture at 720x1280", 2 => "Vertical 9:16 at 1080x1920 (full HD). Runs at 30 fps, needs a strong PC", _ => "Landscape: streams the whole picture" });
                 cycle(hdc, 8, match cfg.stream_vertical { 1 => "Vertical 720p", 2 => "Vertical 1080p", _ => "Landscape" });
+                label(hdc, 9, "Vertical framing", match cfg.stream_vframe { 0 => "Fill: crops to the middle of the picture (very zoomed in)", 2 => "Square: the middle square with bars above and below", _ => "Fit: the whole picture with bars above and below" });
+                cycle(hdc, 9, match cfg.stream_vframe { 0 => "Fill", 2 => "Square", _ => "Fit" });
             }
             _ => {
                 let names = ["Record / stop", "Screenshot", "Save replay", "Pause / resume", "Mute microphone"];

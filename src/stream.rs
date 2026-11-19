@@ -35,6 +35,7 @@ struct Params {
     src_w: u32,
     src_h: u32,
     vertical: u32,
+    vframe: u32,
 }
 
 fn set_status(ctl: &StreamCtl, s: &str) {
@@ -241,6 +242,7 @@ pub fn go_live() {
         src_w: sh.fmt.w,
         src_h: sh.fmt.h,
         vertical: c.stream_vertical,
+        vframe: c.stream_vframe,
         fps: if half { (sh.fmt.fps / 2).max(1) } else { sh.fmt.fps.max(1) },
         audio_rate,
         enc: c.stream_enc,
@@ -708,7 +710,7 @@ unsafe fn prep_sample(src: &IMFSample, p: &Params) -> Option<IMFSample> {
             let mut op: *mut u8 = std::ptr::null_mut();
             if ob.Lock(&mut op, None, None).is_ok() {
                 let d = std::slice::from_raw_parts_mut(op, out_len);
-                crop_scale_nv12(sdat, sw, sh_, d, ow, oh);
+                crop_scale_nv12(sdat, sw, sh_, d, ow, oh, p.vframe);
                 let _ = ob.Unlock();
                 let _ = ob.SetCurrentLength(out_len as u32);
                 if let Ok(os) = MFCreateSample() {
@@ -725,21 +727,28 @@ unsafe fn prep_sample(src: &IMFSample, p: &Params) -> Option<IMFSample> {
     result
 }
 
-/// Centre-crops an NV12 frame to 9:16 and scales it to `ow` x `oh` (Y bilinear, chroma nearest).
-fn crop_scale_nv12(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], ow: usize, oh: usize) {
-    let cw = ((sh * 9 / 16) & !1).min(sw).max(2);
+/// Scales an NV12 frame into a vertical `ow` x `oh` frame. Mode 0 fills it with the middle 9:16 slice, 1 fits the whole
+/// picture (bars above and below), 2 uses the middle square (bars above and below). Y is bilinear, chroma nearest.
+fn crop_scale_nv12(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], ow: usize, oh: usize, mode: u32) {
+    let (cw, dw, dh) = match mode {
+        0 => (((sh * 9 / 16) & !1).min(sw).max(2), ow, oh),
+        2 => (sh.min(sw) & !1, ow, ow),
+        _ => (sw & !1, ow, ((ow * sh / sw) & !1).min(oh).max(2)),
+    };
     let cx = ((sw - cw) / 2) & !1;
+    let oy = ((oh - dh) / 2) & !1;
     let (dy, duv) = dst.split_at_mut(ow * oh);
-    // fixed point 16.16 step per output pixel
-    let xs = (((cw - 1) as u64) << 16) / (ow.max(2) - 1) as u64;
-    let ys = ((((sh - 1) as u64) << 16) / (oh.max(2) - 1) as u64) as usize;
-    let xmap: Vec<(usize, u32)> = (0..ow).map(|x| { let f = x as u64 * xs; (cx + (f >> 16) as usize, ((f >> 8) & 0xff) as u32) }).collect();
-    for y in 0..oh {
+    dy.fill(16);
+    duv.fill(128);
+    let xs = (((cw - 1) as u64) << 16) / (dw.max(2) - 1) as u64;
+    let ys = ((((sh - 1) as u64) << 16) / (dh.max(2) - 1) as u64) as usize;
+    let xmap: Vec<(usize, u32)> = (0..dw).map(|x| { let f = x as u64 * xs; (cx + (f >> 16) as usize, ((f >> 8) & 0xff) as u32) }).collect();
+    for y in 0..dh {
         let f = y * ys;
-        let (y0, fy) = (f >> 16, ((f >> 8) & 0xff) as u32);
+        let (y0, fy) = ((f >> 16).min(sh - 1), ((f >> 8) & 0xff) as u32);
         let y1 = (y0 + 1).min(sh - 1);
         let (r0, r1) = (&src[y0 * sw..(y0 + 1) * sw], &src[y1 * sw..(y1 + 1) * sw]);
-        let row = &mut dy[y * ow..(y + 1) * ow];
+        let row = &mut dy[(oy + y) * ow..(oy + y + 1) * ow];
         for (o, &(x0, fx)) in row.iter_mut().zip(&xmap) {
             let x1 = (x0 + 1).min(sw - 1);
             let top = r0[x0] as u32 * (256 - fx) + r0[x1] as u32 * fx;
@@ -748,12 +757,12 @@ fn crop_scale_nv12(src: &[u8], sw: usize, sh: usize, dst: &mut [u8], ow: usize, 
         }
     }
     let uv = &src[sw * sh..];
-    for y in 0..oh / 2 {
-        let sy = ((y * 2) * ys >> 16) / 2;
+    for y in 0..dh / 2 {
+        let sy = (((y * 2) * ys) >> 16) / 2;
         let srow = &uv[sy.min(sh / 2 - 1) * sw..];
-        let row = &mut duv[y * ow..(y + 1) * ow];
+        let row = &mut duv[(oy / 2 + y) * ow..(oy / 2 + y + 1) * ow];
         for (px, o) in row.chunks_exact_mut(2).enumerate() {
-            let sx = (xmap[px * 2].0 & !1).min(sw - 2);
+            let sx = (xmap[(px * 2).min(dw - 1)].0 & !1).min(sw - 2);
             o[0] = srow[sx];
             o[1] = srow[sx + 1];
         }
