@@ -465,29 +465,114 @@ static HIDDEN: AtomicBool = AtomicBool::new(false);
 static LOW_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const WM_TRAY: u32 = WM_APP + 2;
 
-fn vk_name(vk: u32) -> String {
+/// A hotkey is stored as one number: low 8 bits = virtual key, bit 8 = Alt, bit 9 = Ctrl, bit 10 = Shift.
+/// Old settings files hold a bare virtual key, which decodes as "no modifiers".
+const HK_ALT: u32 = 1 << 8;
+const HK_CTRL: u32 = 1 << 9;
+const HK_SHIFT: u32 = 1 << 10;
+
+fn vk_base_name(vk: u32) -> String {
     match vk {
         0x70..=0x87 => format!("F{}", vk - 0x6F),
         0x60..=0x69 => format!("Numpad {}", vk - 0x60),
+        0x6A => "Numpad *".into(),
+        0x6B => "Numpad +".into(),
+        0x6D => "Numpad -".into(),
+        0x6E => "Numpad .".into(),
+        0x6F => "Numpad /".into(),
+        0x30..=0x39 | 0x41..=0x5A => ((vk as u8) as char).to_string(),
         0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
         0x24 => "Home".into(),
         0x23 => "End".into(),
         0x21 => "Page Up".into(),
         0x22 => "Page Down".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0x20 => "Space".into(),
+        0x09 => "Tab".into(),
+        0x0D => "Enter".into(),
+        0x08 => "Backspace".into(),
         0x13 => "Pause".into(),
         0x91 => "Scroll Lock".into(),
+        0xBA => ";".into(),
+        0xBB => "=".into(),
+        0xBC => ",".into(),
+        0xBD => "-".into(),
+        0xBE => ".".into(),
+        0xBF => "/".into(),
+        0xC0 => "`".into(),
+        0xDB => "[".into(),
+        0xDC => "\\".into(),
+        0xDD => "]".into(),
+        0xDE => "'".into(),
         _ => format!("Key {vk}"),
     }
 }
 
-fn key_allowed(vk: u32) -> bool {
-    matches!(vk, 0x70..=0x79 | 0x7B..=0x87 | 0x60..=0x69 | 0x2D | 0x24 | 0x23 | 0x21 | 0x22 | 0x13 | 0x91)
+fn vk_name(code: u32) -> String {
+    let mut s = String::new();
+    if code & HK_CTRL != 0 {
+        s.push_str("Ctrl+");
+    }
+    if code & HK_ALT != 0 {
+        s.push_str("Alt+");
+    }
+    if code & HK_SHIFT != 0 {
+        s.push_str("Shift+");
+    }
+    s.push_str(&vk_base_name(code & 0xFF));
+    s
+}
+
+/// Keys that exist on the keyboard and make sense as a hotkey.
+fn vk_known(vk: u32) -> bool {
+    matches!(vk, 0x70..=0x87 | 0x60..=0x6F | 0x30..=0x39 | 0x41..=0x5A | 0x2D | 0x2E | 0x24 | 0x23 | 0x21 | 0x22
+        | 0x25..=0x28 | 0x20 | 0x09 | 0x0D | 0x08 | 0x13 | 0x91 | 0xBA..=0xC0 | 0xDB..=0xDE)
+}
+
+/// Checks a key plus modifiers. Err carries the message shown to the user.
+fn hotkey_check(vk: u32, mods: u32) -> Result<(), &'static str> {
+    if !vk_known(vk) {
+        return Err("That key can't be used as a hotkey");
+    }
+    let alt = mods & HK_ALT != 0;
+    let ctrl = mods & HK_CTRL != 0;
+    let shift = mods & HK_SHIFT != 0;
+    // keys that are safe on their own (they don't type anything)
+    let bare_ok = matches!(vk, 0x70..=0x79 | 0x7B..=0x87 | 0x60..=0x6F | 0x2D | 0x24 | 0x23 | 0x21 | 0x22 | 0x13 | 0x91);
+    if mods == 0 && !bare_ok {
+        return Err("Add Ctrl or Alt for this key (a bare key would stop it working in other apps)");
+    }
+    if mods == HK_SHIFT && !bare_ok {
+        return Err("Add Ctrl or Alt: Shift alone would break typing capitals");
+    }
+    if vk == 0x7A && mods == 0 {
+        return Err("F11 is fullscreen in Lumacap; add Ctrl, Alt or Shift or pick another key");
+    }
+    if alt && matches!(vk, 0x73 | 0x09 | 0x20 | 0x1B) {
+        return Err("Windows uses that combo (Alt+F4, Alt+Tab, Alt+Space)");
+    }
+    if ctrl && alt && vk == 0x2E {
+        return Err("Ctrl+Alt+Delete belongs to Windows");
+    }
+    if ctrl && !alt && !shift && matches!(vk, 0x43 | 0x56 | 0x58 | 0x41 | 0x5A | 0x59) {
+        return Err("Ctrl+C/V/X/A/Z/Y are copy, paste and undo everywhere; pick another combo");
+    }
+    Ok(())
+}
+
+fn hk_register(hwnd: HWND, id: i32, code: u32) -> bool {
+    let m = HOT_KEY_MODIFIERS(((code >> 8) & 7) | MOD_NOREPEAT.0);
+    unsafe { RegisterHotKey(hwnd, id, m, code & 0xFF).is_ok() }
 }
 
 unsafe fn register_hotkeys(hwnd: HWND, c: &Settings) {
     for (id, vk) in [(1, c.hk_rec), (2, c.hk_shot), (3, c.hk_replay), (4, c.hk_pause), (5, c.hk_mic)] {
         let _ = UnregisterHotKey(hwnd, id);
-        if RegisterHotKey(hwnd, id, MOD_NOREPEAT, vk).is_err() {
+        if !hk_register(hwnd, id, vk) {
             elogln!("{} is taken by another app; use the on-screen buttons.", vk_name(vk));
         }
     }
@@ -514,9 +599,9 @@ unsafe fn set_hotkey(hwnd: HWND, idx: i32, vk: u32) {
     set(&mut c, vk);
     let id = idx + 1;
     let _ = UnregisterHotKey(hwnd, id);
-    if RegisterHotKey(hwnd, id, MOD_NOREPEAT, vk).is_err() {
+    if !hk_register(hwnd, id, vk) {
         set(&mut c, old);
-        let _ = RegisterHotKey(hwnd, id, MOD_NOREPEAT, old);
+        let _ = hk_register(hwnd, id, old);
         drop(c);
         set_toast(&sh, "That key is taken by another app");
         return;
@@ -4224,7 +4309,7 @@ unsafe fn paint(hwnd: HWND) {
                 let keys = [cfg.hk_rec, cfg.hk_shot, cfg.hk_replay, cfg.hk_pause, cfg.hk_mic];
                 let cap = HK_CAPTURE.load(Ordering::Relaxed);
                 for i in 0..5usize {
-                    label(hdc, i as i32, names[i], if cap == i as i32 { "Press the new key (Esc to cancel)" } else { "Works while a game is focused. Click, then press a key" });
+                    label(hdc, i as i32, names[i], if cap == i as i32 { "Press the new key (Esc to cancel)" } else { "Works while a game is focused. Click, then press any key or combo (Esc cancels)" });
                     cycle(hdc, i as i32, &if cap == i as i32 { "Press a key…".to_string() } else { vk_name(keys[i]) });
                 }
                 label(hdc, 5, "Minimize to tray", "Closing the window keeps recording and replay running");
@@ -4349,12 +4434,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_KEYDOWN | WM_SYSKEYDOWN if HK_CAPTURE.load(Ordering::Relaxed) >= 0 => {
             let k = wp.0 as u32;
             let cap = HK_CAPTURE.load(Ordering::Relaxed);
-            if k == VK_ESCAPE.0 as u32 {
+            let down = |v: VIRTUAL_KEY| GetKeyState(v.0 as i32) < 0;
+            if k == VK_ESCAPE.0 as u32 && !down(VK_CONTROL) && !down(VK_MENU) && !down(VK_SHIFT) {
                 HK_CAPTURE.store(-1, Ordering::Relaxed);
-            } else if key_allowed(k) {
-                set_hotkey(hwnd, cap, k);
-            } else if k != VK_MENU.0 as u32 && k != VK_SHIFT.0 as u32 && k != VK_CONTROL.0 as u32 {
-                set_toast(&ui().sh, "Use F1-F12 (not F11), Insert, Home, End, Page Up/Down, Pause or the numpad");
+            } else if matches!(k, 0x10 | 0x11 | 0x12 | 0xA0..=0xA5 | 0x5B | 0x5C) {
+                // a modifier on its own: keep waiting for the actual key
+            } else if down(VK_LWIN) || down(VK_RWIN) {
+                set_toast(&ui().sh, "Windows-key combos are reserved by Windows");
+            } else {
+                let mods = (if down(VK_MENU) { HK_ALT } else { 0 })
+                    | (if down(VK_CONTROL) { HK_CTRL } else { 0 })
+                    | (if down(VK_SHIFT) { HK_SHIFT } else { 0 });
+                match hotkey_check(k, mods) {
+                    Ok(()) => set_hotkey(hwnd, cap, k | mods),
+                    Err(m) => set_toast(&ui().sh, m),
+                }
             }
             let _ = InvalidateRect(hwnd, None, false);
             LRESULT(0)

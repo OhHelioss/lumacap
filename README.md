@@ -11,7 +11,7 @@ A tiny, fast, open-source recorder for capture cards on Windows. One exe, no ins
 - Game and microphone audio mixing, optional separate mic track, pause/resume
 - Screenshots (PNG)
 - Library with thumbnails, durations, trim and export (lossless remux)
-- Custom global hotkeys (defaults: F9 record, F10 screenshot, F8 replay, F7 pause, F12 mute mic)
+- Custom global hotkeys: any key or combo (Ctrl/Alt/Shift + key), defaults F9 record, F10 screenshot, F8 replay, F7 pause, F12 mute mic. Windows-key combos and Windows shortcuts (Alt+F4, Alt+Tab, Ctrl+C/V...) are refused, as are combos already used by another action or another app
 - Quality presets (Small / Balanced / High / Max), capture-card picker
 - Low-disk-space warning and auto-stop, optional auto-split of long recordings (15/30/60 min)
 - Minimize to tray and start with Windows
