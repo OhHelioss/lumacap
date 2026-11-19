@@ -226,6 +226,48 @@ impl Writer {
     }
 }
 
+/// Debug copy of what is sent, as an FLV file (first ~16 MB of a stream session), so a bad picture on the
+/// server side can be checked offline. Lives in %APPDATA%\\lumacap\\stream-debug.flv, overwritten per session.
+static DUMP: Mutex<(u8, Option<std::fs::File>, u64)> = Mutex::new((0, None, 0));
+
+pub fn dump_reset() {
+    if let Ok(mut d) = DUMP.lock() {
+        *d = (0, None, 0);
+    }
+}
+
+fn dump_write(ts: u32, kind: u8, payload: &[u8]) {
+    use std::io::Write;
+    let Ok(mut d) = DUMP.lock() else { return };
+    if d.0 == 2 || !matches!(kind, 8 | 9 | 18) {
+        return;
+    }
+    if d.0 == 0 {
+        d.0 = 2;
+        let dir = std::env::var("APPDATA").map(|a| format!("{a}\\lumacap")).unwrap_or_else(|_| ".".into());
+        let _ = std::fs::create_dir_all(&dir);
+        let Ok(mut f) = std::fs::File::create(format!("{dir}\\stream-debug.flv")) else { return };
+        let _ = f.write_all(&[b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0]);
+        d.1 = Some(f);
+        d.0 = 1;
+    }
+    let n = payload.len() as u32;
+    let mut tag = Vec::with_capacity(payload.len() + 15);
+    tag.push(kind);
+    tag.extend_from_slice(&n.to_be_bytes()[1..]);
+    tag.extend_from_slice(&ts.to_be_bytes()[1..]);
+    tag.push((ts >> 24) as u8);
+    tag.extend_from_slice(&[0, 0, 0]);
+    tag.extend_from_slice(payload);
+    tag.extend_from_slice(&(n + 11).to_be_bytes());
+    let ok = d.1.as_mut().map(|f| f.write_all(&tag).is_ok()).unwrap_or(false);
+    d.2 += tag.len() as u64;
+    if !ok || d.2 > 16 * 1024 * 1024 {
+        d.1 = None;
+        d.0 = 2;
+    }
+}
+
 pub struct Publisher {
     w: Arc<Mutex<Writer>>,
     stream_id: u32,
@@ -428,9 +470,9 @@ impl Publisher {
         lock(&w)?.send_msg(CSID_CMD, 0, 20, stream_id, &p)?;
         let st = wait_for(&mut reader, &w, |m| m.kind == 20 && amf_first_string(&m.payload).as_deref() == Some("onStatus"), "publish")?;
         let codes = amf_all_strings(&st.payload);
-        crate::log_line(&format!("stream: publish answer: {}", codes.join(" | ")));
+        crate::log_line(&format!("stream: publish answer: {}", codes.join(" | ").replace(key, "<key>")));
         if !codes.iter().any(|c| c == "NetStream.Publish.Start") {
-            let why = codes.iter().find(|c| c.starts_with("NetStream.")).cloned().unwrap_or_else(|| "the server refused the stream".into());
+            let why = codes.iter().find(|c| c.starts_with("NetStream.")).cloned().unwrap_or_else(|| "the server refused the stream".into()).replace(key, "<key>");
             return Err(format!("publish failed: {why} (check the stream key)"));
         }
 
@@ -501,6 +543,7 @@ impl Publisher {
         if let Some(e) = self.is_dead() {
             return Err(e);
         }
+        dump_write(ts, kind, payload);
         let mut g = self.w.lock().map_err(|_| "internal error".to_string())?;
         let r = g.send_msg(csid, ts, kind, self.stream_id, payload);
         self.bytes_out.store(g.sent, Ordering::Relaxed);

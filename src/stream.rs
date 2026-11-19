@@ -457,10 +457,12 @@ fn connect_pub(p: &Params) -> Result<Publisher, String> {
 }
 
 fn run_stream(ctl: &Arc<StreamCtl>, rx_v: Receiver<Sendable<IMFSample>>, rx_a: Receiver<Vec<u8>>, p: &Params) -> Result<(), String> {
+    crate::rtmp::dump_reset();
     set_status(ctl, "Connecting…");
     let mut pubr = connect_pub(p)?; // a wrong key or address fails right here
     set_status(ctl, "Starting encoder…");
     let mut run = unsafe { Run::new(p)? };
+    crate::log_line(&format!("stream: encoder {}x{} @ {} fps, {} kbps, {}, audio {}", p.w, p.h, p.fps, p.kbps, if run.hw { "GPU" } else { "software" }, p.audio_rate.map(|r| format!("{r} Hz")).unwrap_or_else(|| "none".into())));
     run.announce(&pubr, p)?;
     ctl.live.store(true, Ordering::Relaxed);
     let mut attempts = 0u32;
