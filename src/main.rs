@@ -2611,7 +2611,7 @@ fn tab_rows(tab: i32) -> &'static [K] {
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
         4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle, K::Change],
         5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle, K::Cycle],
-        _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
+        _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Cycle],
     }
 }
 
@@ -4109,7 +4109,7 @@ unsafe fn paint(hwnd: HWND) {
                 });
                 label(hdc, 6, "Capture card", &format!("Restart to apply  ·  {}  ·  {} glitched frames", MODE.lock().unwrap(), sh.glitches.load(Ordering::Relaxed)));
                 pick(hdc, 6, if cfg.video_name.is_empty() { &ui.device } else { &cfg.video_name });
-                label(hdc, 7, "Elgato drivers", "Card not detected? Opens Elgato's official driver page");
+                label(hdc, 7, "Elgato drivers", "Opens Elgato's official driver page");
                 cycle(hdc, 7, "Open page");
             }
             1 => {
@@ -4231,7 +4231,7 @@ unsafe fn paint(hwnd: HWND) {
                 toggle(hdc, 5, cfg.tray);
                 label(hdc, 6, "Start with Windows", "Starts hidden in the tray, ready for instant replay");
                 toggle(hdc, 6, cfg.autostart);
-                label(hdc, 7, "Updates", "Only GitHub is contacted. Auto installs after checking the release's SHA-256");
+                label(hdc, 7, "Updates", "Only GitHub is contacted. Auto-install checks SHA-256");
                 cycle(hdc, 7, ["Off", "Notify only", "Auto-install"][cfg.update_mode.min(2) as usize]);
             }
         }
