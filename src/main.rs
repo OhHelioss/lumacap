@@ -4913,7 +4913,7 @@ fn run() -> R<()> {
                     if sh_u.cfg.lock().unwrap().update_mode > 0 {
                         if let Some(rel) = update::fetch_latest() {
                             if version_tuple(&rel.tag) > version_tuple(env!("CARGO_PKG_VERSION")) {
-                                set_toast(&sh_u, &format!("Update available: {} (github.com/OhHelioss/lumacap/releases)", rel.tag));
+                                set_toast(&sh_u, &format!("Update available: {} (github.com/TheBuildShelf/lumacap/releases)", rel.tag));
                                 return;
                             }
                         }

@@ -21,14 +21,20 @@ A tiny, fast, open-source recorder for capture cards on Windows. One exe, no ins
 
 ## Download
 
-**[Download the latest `lumacap.exe`](https://github.com/OhHelioss/lumacap/releases/latest)** (no installer, just run it). Windows SmartScreen may warn because the exe is not code-signed: choose *More info → Run anyway*.
+**[Download the latest release](https://github.com/TheBuildShelf/lumacap/releases/latest)** and pick one:
+- `Lumacap-Setup.exe`: a normal installer. It installs just for you (no admin prompt), adds a Start menu entry, an optional desktop shortcut and an uninstaller.
+- `lumacap.exe`: the portable version. No installer, just run it from anywhere.
+
+Both are the same program and share the same settings in `%APPDATA%\lumacap`, so you can switch between them. Uninstalling removes the program but keeps your settings and recordings.
+
+Windows SmartScreen may warn because the files are not code-signed: choose *More info → Run anyway*.
 
 ## Build it yourself
 
 Or build it yourself:
 
 ```
-git clone https://github.com/OhHelioss/lumacap
+git clone https://github.com/TheBuildShelf/lumacap
 cd lumacap
 cargo build --release
 ```

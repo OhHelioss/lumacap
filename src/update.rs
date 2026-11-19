@@ -76,7 +76,7 @@ fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 pub fn fetch_latest() -> Option<Release> {
-    let body = http_get("api.github.com", "/repos/OhHelioss/lumacap/releases/latest", 512 * 1024)?;
+    let body = http_get("api.github.com", "/repos/TheBuildShelf/lumacap/releases/latest", 512 * 1024)?;
     let text = String::from_utf8_lossy(&body).to_string();
     let tag = field(&text, "tag_name")?.to_string();
     let mut url = None;
