@@ -828,6 +828,11 @@ struct Recorder {
     half: bool, // 30 fps output from a 60 fps capture
     fcount: AtomicU32,
     // diagnostics for lumacap.log
+    v_dur: i64,           // nominal output frame duration (100 ns)
+    v_next: AtomicI64,    // timestamp the next frame should get (-1 = not started)
+    d_early: AtomicU32,   // frames dropped because they arrived early
+    d_nonmono: AtomicU32, // source timestamps that went backwards
+    d_mingap_us: AtomicI64,
     d_frames: AtomicU32,
     d_errs: AtomicU32,
     d_gaps: AtomicU32,    // frame gaps over 50 ms
@@ -953,6 +958,11 @@ unsafe fn start_recorder(path: &str, f: &VideoFmt, bitrate_bps: u32, afmt: Optio
         m_skip: AtomicI64::new(0),
         half: o.half,
         fcount: AtomicU32::new(0),
+        v_dur: 10_000_000 / fps.max(1) as i64,
+        v_next: AtomicI64::new(-1),
+        d_early: AtomicU32::new(0),
+        d_nonmono: AtomicU32::new(0),
+        d_mingap_us: AtomicI64::new(i64::MAX),
         d_frames: AtomicU32::new(0),
         d_errs: AtomicU32::new(0),
         d_gaps: AtomicU32::new(0),
@@ -980,13 +990,16 @@ fn finalize_when_free(rec: Arc<Recorder>) -> std::thread::JoinHandle<()> {
             let wall = rec.started.elapsed().as_secs_f64().max(0.001);
             let fr = rec.d_frames.load(Ordering::Relaxed);
             if !rec.path.contains("\\seg_") { logln!(
-                "recording stats: {} frames in {:.1}s wall ({:.1} fps), video ends at {:.1}s, max capture gap {} ms, gaps over 50 ms: {}, slowest WriteSample {} ms, write errors: {}{}, finalize: {:?}",
+                "recording stats: {} frames in {:.1}s wall ({:.1} fps), video ends at {:.1}s, capture gap min {} us / max {} ms, gaps over 50 ms: {}, backwards timestamps: {}, dropped early: {}, slowest WriteSample {} ms, write errors: {}{}, finalize: {:?}",
                 fr,
                 wall,
                 fr as f64 / wall,
                 rec.d_last_t.load(Ordering::Relaxed) as f64 / 1e7,
+                { let m = rec.d_mingap_us.load(Ordering::Relaxed); if m == i64::MAX { 0 } else { m } },
                 rec.d_maxgap_us.load(Ordering::Relaxed) / 1000,
                 rec.d_gaps.load(Ordering::Relaxed),
+                rec.d_nonmono.load(Ordering::Relaxed),
+                rec.d_early.load(Ordering::Relaxed),
                 rec.d_maxwrite_us.load(Ordering::Relaxed) / 1000,
                 rec.d_errs.load(Ordering::Relaxed),
                 { let e = rec.d_first_err.lock().unwrap(); if e.is_empty() { String::new() } else { format!(" (first: {})", *e) } },
@@ -1084,12 +1097,29 @@ fn write_video(rec: &Recorder, sample: &IMFSample, ts: i64) {
             let gap = (ts - rec.v_last_end.load(Ordering::SeqCst)).max(0);
             rec.v_skip.fetch_add(gap, Ordering::SeqCst);
         }
-        let t = ts - rec.base.load(Ordering::SeqCst) - rec.v_skip.load(Ordering::SeqCst);
-        if t < 0 {
+        let dev_t = ts - rec.base.load(Ordering::SeqCst) - rec.v_skip.load(Ordering::SeqCst);
+        if dev_t < 0 {
             return;
         }
+        // Capture cards deliver frames in bursts, so the device timestamps jitter (an HD60 X recording showed 33 to
+        // 127 fps "variable" timing). Players then drop or freeze frames. Snap the timestamps to an even grid and only
+        // follow the device clock when it has really moved (dropped frames) or a frame arrives far too early.
+        let vd = rec.v_dur.max(1);
+        let exp = rec.v_next.load(Ordering::SeqCst);
+        let t = if exp < 0 {
+            dev_t
+        } else if dev_t + vd < exp {
+            rec.d_early.fetch_add(1, Ordering::Relaxed);
+            return;
+        } else if dev_t < exp + vd {
+            exp
+        } else {
+            dev_t
+        };
+        rec.v_next.store(t + vd, Ordering::SeqCst);
         rec.v_last_end.store(ts + dur, Ordering::SeqCst);
         let _ = sample.SetSampleTime(t);
+        let _ = sample.SetSampleDuration(vd);
         let t0 = Instant::now();
         let res = rec.writer.0.WriteSample(rec.video_idx, sample);
         let wus = t0.elapsed().as_micros() as i64;
@@ -1099,6 +1129,11 @@ fn write_video(rec: &Recorder, sample: &IMFSample, ts: i64) {
         let prev = rec.d_prev_ts.swap(ts, Ordering::Relaxed);
         if prev >= 0 {
             let gap = (ts - prev) / 10; // 100 ns -> us
+            if gap <= 0 {
+                rec.d_nonmono.fetch_add(1, Ordering::Relaxed);
+            } else if gap < rec.d_mingap_us.load(Ordering::Relaxed) {
+                rec.d_mingap_us.store(gap, Ordering::Relaxed);
+            }
             if gap > rec.d_maxgap_us.load(Ordering::Relaxed) {
                 rec.d_maxgap_us.store(gap, Ordering::Relaxed);
             }
@@ -2567,7 +2602,7 @@ fn start_recording() {
     };
     match unsafe { start_recorder(&path, &sh.fmt, c.bitrate * 1_000_000, sh.afmt.as_ref(), &opts) } {
         Ok(rec) => {
-            logln!("recording: {}", path);
+            logln!("recording: {} ({} {}x{} @ {} fps{}, {} Mbps requested, {})", path, if c.hevc { "HEVC" } else { "H.264" }, sh.fmt.w, sh.fmt.h, if opts.half { sh.fmt.fps / 2 } else { sh.fmt.fps }, if opts.half { " (30 fps mode)" } else { "" }, c.bitrate, if c.fmp4 { "safe MP4" } else { "MP4" });
             *sh.rec.lock().unwrap() = Some(Arc::new(rec));
         }
         Err(e) => {
