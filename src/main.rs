@@ -2650,13 +2650,15 @@ static EDIT: Mutex<Option<(u8, String)>> = Mutex::new(None);
 
 fn edit_commit(sh: &Shared) {
     let Some((field, text)) = EDIT.lock().unwrap().take() else { return };
-    let text = text.trim().to_string();
+    // pasted text often carries spaces or line breaks from the web page: drop them
+    let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
     if field == 0 {
-        if text.starts_with("rtmp://") {
+        let low = text.to_ascii_lowercase();
+        if low.starts_with("rtmp://") || low.starts_with("rtmps://") {
             sh.cfg.lock().unwrap().stream_custom = text;
             set_toast(sh, "Server address saved");
         } else {
-            set_toast(sh, "The address must start with rtmp://");
+            set_toast(sh, "The address must start with rtmp:// or rtmps://");
         }
     } else if !text.is_empty() {
         sh.cfg.lock().unwrap().stream_key = text;
