@@ -2457,7 +2457,7 @@ const T_P1: i32 = 75;
 const T_EXPORT: i32 = 76;
 const P_CLOSE: i32 = 20;
 const P_TAB0: i32 = 30; // 30..32
-const P_ROW0: i32 = 40; // row i: 40+3i (left/main), 41+3i (right)
+const P_ROW0: i32 = 200; // row i: 200+3i (left/main), 201+3i (right); keep clear of L_*/T_* ids
 
 static TAB: AtomicI32 = AtomicI32::new(0);
 static LIB_OPEN: AtomicBool = AtomicBool::new(false);
