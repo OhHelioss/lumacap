@@ -454,6 +454,9 @@ static MON_PLAYING: AtomicBool = AtomicBool::new(false);
 static PRESENTS: AtomicU32 = AtomicU32::new(0);
 static PRESENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PAINTS: AtomicU32 = AtomicU32::new(0);
+static T_DRAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_CHIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static T_BLT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PV_LOGGED: AtomicU32 = AtomicU32::new(0);
 static LAST_FPS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HK_CAPTURE: AtomicI32 = AtomicI32::new(-1);
@@ -3558,22 +3561,28 @@ unsafe fn fast_present(hwnd: HWND) -> bool {
             }
             return false;
         }
+        let td = now_us();
         draw_preview(hdc, f.dx, f.dy, f.dw, f.dh, &buf.data, buf.w as i32, buf.h as i32);
+        T_DRAW.fetch_add(now_us().saturating_sub(td), Ordering::Relaxed);
     }
     if let Some(r) = rgn {
         SelectClipRgn(hdc, None);
         let _ = DeleteObject(r);
     }
+    let tc = now_us();
     let prev_rect = RECT { left: f.dx, top: f.dy, right: f.dx + f.dw, bottom: f.dy + f.dh };
     if !f.full {
         round_rect_argb(hdc, &prev_rect, f.prad, 0x00000000, Some((rgb(44, 48, 58), 1)));
     }
     draw_chips(hdc, f.dx, f.dy, f.dw, &f.rec, &f.replay, &f.fps);
+    T_CHIPS.fetch_add(now_us().saturating_sub(tc), Ordering::Relaxed);
+    let tb = now_us();
     let wdc = GetDC(hwnd);
     let (l, t) = ((f.dx - 2).max(0), (f.dy - 2).max(0));
     let (r, b) = ((f.dx + f.dw + 2).min(f.w), (f.dy + f.dh + 2).min(f.h));
     let _ = BitBlt(wdc, l, t, r - l, b - t, hdc, l, t, SRCCOPY);
     ReleaseDC(hwnd, wdc);
+    T_BLT.fetch_add(now_us().saturating_sub(tb), Ordering::Relaxed);
     true
 }
 
@@ -4423,7 +4432,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         PRESENT_US.fetch_add(took, Ordering::Relaxed);
                         // Only back off when a present is really slow (input could starve); a normal 3-8 ms draw
                         // must not cost frames at 60 fps.
-                        if took > 10_000 {
+                        if took > 25_000 {
                             NEXT_PRESENT_US.store(now_us() + took.min(50_000), Ordering::Relaxed);
                         }
                     } else if paint_allowed() {
@@ -4448,15 +4457,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let pres = PRESENTS.swap(0, Ordering::Relaxed) as u64;
                 let pus = PRESENT_US.swap(0, Ordering::Relaxed);
                 let pnt = PAINTS.swap(0, Ordering::Relaxed);
+                let (t_d, t_c, t_b) = (T_DRAW.swap(0, Ordering::Relaxed), T_CHIPS.swap(0, Ordering::Relaxed), T_BLT.swap(0, Ordering::Relaxed));
                 let shown = (pres + pnt as u64) * 1000 / since.max(1);
                 if fps >= 25 && shown * 100 < fps * 85 && !HIDDEN.load(Ordering::Relaxed) && PV_LOGGED.load(Ordering::Relaxed) < 30 {
                     PV_LOGGED.fetch_add(1, Ordering::Relaxed);
                     logln!(
-                        "preview: capture {} fps, drawn {} /s (fast {} avg {} us, full repaints {}), panel={} full_preview={}",
+                        "preview: capture {} fps, drawn {} /s (fast {} avg {} us [stretch {} us, chips {} us, blit {} us], full repaints {}), panel={} full_preview={}",
                         fps,
                         shown,
                         pres,
                         if pres > 0 { pus / pres } else { 0 },
+                        if pres > 0 { t_d / pres } else { 0 },
+                        if pres > 0 { t_c / pres } else { 0 },
+                        if pres > 0 { t_b / pres } else { 0 },
                         pnt,
                         PANEL.load(Ordering::Relaxed),
                         sh.pv_full.load(Ordering::Relaxed)
@@ -4470,7 +4483,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 || TRIM_OPEN.load(Ordering::Relaxed)
                 || FAST.lock().unwrap().is_none()
                 || ANIM.lock().unwrap().iter().any(|&a| a != 0);
-            if (busy || t % 3 == 0) && paint_allowed() && !HIDDEN.load(Ordering::Relaxed) {
+            if (busy || t % 10 == 0) && paint_allowed() && !HIDDEN.load(Ordering::Relaxed) {
                 let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
