@@ -3698,6 +3698,49 @@ unsafe fn draw_preview(hdc: HDC, dx: i32, dy: i32, dw: i32, dh: i32, data: &[u32
     StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, pvw, pvh, Some(data.as_ptr() as *const c_void), &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
+/// Vertical streaming guide on the preview: dims what the 9:16 stream leaves out and labels the framing.
+/// Preview only: it is never recorded or streamed.
+unsafe fn draw_vframe(hdc: HDC, dx: i32, dy: i32, dw: i32, dh: i32) {
+    let u = ui();
+    let (mode, frame) = {
+        let c = u.sh.cfg.lock().unwrap();
+        (c.stream_vertical, c.stream_vframe)
+    };
+    if mode == 0 || dw < 50 || dh < 50 {
+        return;
+    }
+    // width of the part of the picture that is streamed
+    let keep = match frame {
+        0 => dh * 9 / 16,
+        2 => dh,
+        _ => dw,
+    }
+    .min(dw);
+    let x0 = dx + (dw - keep) / 2;
+    if keep < dw {
+        let left = RECT { left: dx, top: dy, right: x0, bottom: dy + dh };
+        let right = RECT { left: x0 + keep, top: dy, right: dx + dw, bottom: dy + dh };
+        round_rect_argb(hdc, &left, 0, 0xB0000000, None);
+        round_rect_argb(hdc, &right, 0, 0xB0000000, None);
+    }
+    let edge = RECT { left: x0, top: dy, right: x0 + keep, bottom: dy + dh };
+    round_rect_argb(hdc, &edge, 0, 0x00000000, Some((rgb(145, 80, 255), 2)));
+    let name = match frame {
+        0 => "Vertical: middle slice (Fill)",
+        2 => "Vertical: middle square, bars above and below",
+        _ => "Vertical: whole picture, bars above and below (Fit)",
+    };
+    let f = font(13, 600, w!("Segoe UI"));
+    SelectObject(hdc, f);
+    let wpx = s(30) + name.chars().count() as i32 * s(7);
+    let pill = RECT { left: dx + (dw - wpx) / 2, top: dy + dh - s(46), right: dx + (dw + wpx) / 2, bottom: dy + dh - s(16) };
+    round_rect_argb(hdc, &pill, (pill.bottom - pill.top) / 2, 0xC8101216, Some((rgb(44, 48, 58), 1)));
+    let mut tr = RECT { left: pill.left, top: pill.top + s(5), right: pill.right, bottom: pill.bottom };
+    text(hdc, name, &mut tr, rgb(236, 238, 242), DT_CENTER | DT_SINGLELINE);
+    SelectObject(hdc, GetStockObject(SYSTEM_FONT));
+    let _ = DeleteObject(f);
+}
+
 unsafe fn draw_chips(hdc: HDC, dx: i32, dy: i32, dw: i32, rec: &Option<(u64, bool)>, replay: &Option<String>, fps: &Option<String>) {
     let white = rgb(236, 238, 242);
     let red = rgb(240, 68, 76);
@@ -3794,6 +3837,7 @@ unsafe fn fast_present(hwnd: HWND) -> bool {
         round_rect_argb(hdc, &prev_rect, f.prad, 0x00000000, Some((rgb(44, 48, 58), 1)));
     }
     draw_chips(hdc, f.dx, f.dy, f.dw, &f.rec, &f.replay, &f.fps);
+    draw_vframe(hdc, f.dx, f.dy, f.dw, f.dh);
     T_CHIPS.fetch_add(now_us().saturating_sub(tc), Ordering::Relaxed);
     let tb = now_us();
     let wdc = GetDC(hwnd);
@@ -3909,6 +3953,7 @@ unsafe fn paint(hwnd: HWND) {
     let chip_replay: Option<String> = if recording.is_none() && replay_on { Some(format!("Replay {}s", cfg.replay_secs)) } else { None };
     let chip_fps: Option<String> = if frames > 0 && fps_in > 0 { Some(format!("{}p  ·  {} fps", sh.fmt.h, fps_in)) } else { None };
     draw_chips(hdc, dx, dy, dw, &chip_rec, &chip_replay, &chip_fps);
+    draw_vframe(hdc, dx, dy, dw, dh);
 
     // ---- bottom bar (floating dock) ----
     if !full {
@@ -4392,7 +4437,7 @@ unsafe fn paint(hwnd: HWND) {
                 SelectObject(hdc, f_norm);
                 label(hdc, 7, "Video encoder", match cfg.stream_enc { 1 => "Software only: works everywhere, uses more CPU", 2 => "GPU only: light on the CPU, but some AMD cards give a green picture", _ => "Auto: tries software first, then the GPU" });
                 cycle(hdc, 7, match cfg.stream_enc { 1 => "Software", 2 => "GPU", _ => "Auto" });
-                label(hdc, 8, "Orientation", match cfg.stream_vertical { 1 => "Vertical 9:16 for TikTok: the middle of the picture at 720x1280", 2 => "Vertical 9:16 at 1080x1920 (full HD). Runs at 30 fps, needs a strong PC", _ => "Landscape: streams the whole picture" });
+                label(hdc, 8, "Orientation", match cfg.stream_vertical { 1 => "Vertical 9:16 at 720x1280, stream only (recordings stay landscape)", 2 => "Vertical 9:16 at 1080x1920, stream only. Runs at 30 fps, needs a strong PC", _ => "Landscape: streams the whole picture" });
                 cycle(hdc, 8, match cfg.stream_vertical { 1 => "Vertical 720p", 2 => "Vertical 1080p", _ => "Landscape" });
                 label(hdc, 9, "Vertical framing", match cfg.stream_vframe { 0 => "Fill: crops to the middle of the picture (very zoomed in)", 2 => "Square: the middle square with bars above and below", _ => "Fit: the whole picture with bars above and below" });
                 cycle(hdc, 9, match cfg.stream_vframe { 0 => "Fill", 2 => "Square", _ => "Fit" });
