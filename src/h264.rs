@@ -40,7 +40,7 @@ pub fn annexb_to_avcc(data: &[u8]) -> Converted {
         match t {
             7 => c.sps = Some(nal.to_vec()),
             8 => c.pps = Some(nal.to_vec()),
-            9 => {}
+            9 | 12 => {}
             _ => {
                 if t == 5 {
                     c.keyframe = true;

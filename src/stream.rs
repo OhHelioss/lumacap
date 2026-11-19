@@ -327,7 +327,8 @@ unsafe fn configure_video(act: &IMFActivate, w: u32, h: u32, fps: u32, kbps: u32
 unsafe fn make_video_encoder(w: u32, h: u32, fps: u32, kbps: u32) -> Result<(VEnc, bool), String> {
     let info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
     let mut last = String::from("no H.264 encoder found");
-    for hw in [true, false] {
+    // Software encoder first: the GPU encoder on some AMD setups writes streams that decoders reject (green picture).
+    for hw in [false, true] {
         let flags = if hw { MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER } else { MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER };
         let mut arr: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut n = 0u32;
