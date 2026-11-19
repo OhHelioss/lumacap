@@ -1394,9 +1394,16 @@ fn preview_thread(sh: Arc<Shared>) {
             if len as usize >= w * h * 3 / 2 {
                 let src = std::slice::from_raw_parts(p, w * h * 3 / 2);
                 let full = sh.pv_full.load(Ordering::Relaxed);
-                let (pw, ph) = if full { (w, h) } else { (w / 2, h / 2) };
+                let (tw, th) = (PV_TW.load(Ordering::Relaxed).max(0) as usize, PV_TH.load(Ordering::Relaxed).max(0) as usize);
+                // on-screen size between half and full capture size: scale once, here, with a smooth filter
+                let smooth = tw * 2 > w && tw < w && th * 2 > h && th < h && tw >= 16 && th >= 16;
+                let (pw, ph) = if smooth { (tw, th) } else if full { (w, h) } else { (w / 2, h / 2) };
                 spare.resize(pw * ph, 0);
-                nv12_to_bgra(src, w, h, &mut spare, full);
+                if smooth {
+                    nv12_scale_to_bgra(src, w, h, &mut spare, tw, th);
+                } else {
+                    nv12_to_bgra(src, w, h, &mut spare, full);
+                }
                 {
                     let mut pv = sh.preview.lock().unwrap();
                     pv.w = pw;
@@ -1418,6 +1425,48 @@ fn preview_thread(sh: Arc<Shared>) {
 }
 
 /// NV12 -> BGRA. `full`: 1:1 conversion. Otherwise 2x2 box-filtered half size (much sharper than skipping pixels).
+static PV_TW: AtomicI32 = AtomicI32::new(0);
+static PV_TH: AtomicI32 = AtomicI32::new(0);
+
+/// Bilinear NV12 -> BGRA scaler to exactly the on-screen size, so the final blit is 1:1 and text stays smooth.
+fn nv12_scale_to_bgra(src: &[u8], w: usize, h: usize, dst: &mut [u32], tw: usize, th: usize) {
+    let uv = &src[w * h..];
+    let px = |yv: i32, u: i32, v: i32| -> u32 {
+        let c = 298 * (yv - 16);
+        let r = ((c + 459 * v + 128) >> 8).clamp(0, 255) as u32;
+        let g = ((c - 55 * u - 136 * v + 128) >> 8).clamp(0, 255) as u32;
+        let b = ((c + 541 * u + 128) >> 8).clamp(0, 255) as u32;
+        (r << 16) | (g << 8) | b
+    };
+    // per-column source index (x0, x1), weight (0..256) and chroma pair offset
+    let mut cols: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(tw);
+    for x in 0..tw {
+        let fx = ((x as f32 + 0.5) * w as f32 / tw as f32 - 0.5).clamp(0.0, (w - 1) as f32);
+        let x0 = fx as usize;
+        let x1 = (x0 + 1).min(w - 1);
+        let wt = ((fx - x0 as f32) * 256.0) as u32;
+        let cx = (fx + 0.5) as usize;
+        cols.push((x0 as u32, x1 as u32, wt, (cx.min(w - 1) & !1) as u32));
+    }
+    for y in 0..th {
+        let fy = ((y as f32 + 0.5) * h as f32 / th as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+        let y0 = fy as usize;
+        let y1 = (y0 + 1).min(h - 1);
+        let wy = ((fy - y0 as f32) * 256.0) as u32;
+        let cy = ((fy + 0.5) as usize).min(h - 1) / 2;
+        let (r0, r1) = (&src[y0 * w..(y0 + 1) * w], &src[y1 * w..(y1 + 1) * w]);
+        let uvrow = &uv[cy * w..(cy + 1) * w];
+        let out = &mut dst[y * tw..(y + 1) * tw];
+        for (o, &(x0, x1, wx, cx)) in out.iter_mut().zip(cols.iter()) {
+            let (x0, x1, cx) = (x0 as usize, x1 as usize, cx as usize);
+            let top = r0[x0] as u32 * (256 - wx) + r0[x1] as u32 * wx;
+            let bot = r1[x0] as u32 * (256 - wx) + r1[x1] as u32 * wx;
+            let l = ((top * (256 - wy) + bot * wy + 32768) >> 16) as i32;
+            *o = px(l, uvrow[cx] as i32 - 128, uvrow[cx + 1] as i32 - 128);
+        }
+    }
+}
+
 fn nv12_to_bgra(src: &[u8], w: usize, h: usize, dst: &mut [u32], full: bool) {
     let uv = &src[w * h..];
     let px = |yv: i32, u: i32, v: i32| -> u32 {
@@ -3544,6 +3593,8 @@ unsafe fn fast_present(hwnd: HWND) -> bool {
     }
     let fw = sh.fmt.w as i64;
     sh.pv_full.store(f.dw as i64 * 10 > fw * 6, Ordering::Relaxed);
+    PV_TW.store(f.dw, Ordering::Relaxed);
+    PV_TH.store(f.dh, Ordering::Relaxed);
     let hdc = f.dc;
     let rgn = if f.prad > 0 {
         let r = CreateRoundRectRgn(f.dx, f.dy, f.dx + f.dw + 1, f.dy + f.dh + 1, f.prad * 2, f.prad * 2);
@@ -3661,6 +3712,8 @@ unsafe fn paint(hwnd: HWND) {
     };
     if frames > 0 && fps_in > 0 {
         sh.pv_full.store(dw as i64 * 10 > fw * 6, Ordering::Relaxed);
+        PV_TW.store(dw, Ordering::Relaxed);
+        PV_TH.store(dh, Ordering::Relaxed);
         let buf = sh.preview.lock().unwrap();
         draw_preview(hdc, dx, dy, dw, dh, &buf.data, buf.w as i32, buf.h as i32);
     } else {
