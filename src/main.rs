@@ -305,7 +305,7 @@ impl Settings {
                     "hk_mic" => s.hk_mic = v.parse().unwrap_or(s.hk_mic),
                     "video_name" => s.video_name = v.to_string(),
                     "update_check" => s.update_mode = if v == "0" { 0 } else { 1 },
-                    "update_mode" => s.update_mode = v.parse::<u8>().unwrap_or(1).min(2),
+                    "update_mode" => s.update_mode = if v.parse::<u8>().unwrap_or(1) == 0 { 0 } else { 1 },
                     "stream_server" => s.stream_server = v.parse().unwrap_or(0).min(3),
                     "stream_custom" => s.stream_custom = v.to_string(),
                     "stream_key" => s.stream_key = v.to_string(),
@@ -2611,7 +2611,7 @@ fn tab_rows(tab: i32) -> &'static [K] {
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
         4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle, K::Change],
         5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle, K::Cycle],
-        _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Cycle],
+        _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
 }
 
@@ -3112,7 +3112,7 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 }
                 (3, 7) => {
                     let mut c = sh.cfg.lock().unwrap();
-                    c.update_mode = (c.update_mode + 1) % 3;
+                    c.update_mode = if c.update_mode == 0 { 1 } else { 0 };
                 }
                 (4, 0) => {
                     let mut c = sh.cfg.lock().unwrap();
@@ -4231,8 +4231,8 @@ unsafe fn paint(hwnd: HWND) {
                 toggle(hdc, 5, cfg.tray);
                 label(hdc, 6, "Start with Windows", "Starts hidden in the tray, ready for instant replay");
                 toggle(hdc, 6, cfg.autostart);
-                label(hdc, 7, "Updates", "Only GitHub is contacted. Auto-install checks SHA-256");
-                cycle(hdc, 7, ["Off", "Notify only", "Auto-install"][cfg.update_mode.min(2) as usize]);
+                label(hdc, 7, "Notify about updates", "Asks GitHub for the latest version at startup; nothing else is sent");
+                toggle(hdc, 7, cfg.update_mode > 0);
             }
         }
     }
@@ -4809,31 +4809,15 @@ fn run() -> R<()> {
             let dev = ui().device.clone();
             scene::set_cam(&cfg.cam_name, &dev);
         }
-        update::cleanup_old();
         if cfg.update_mode > 0 {
             let sh_u = sh.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_secs(6));
                 loop {
-                    let mode = sh_u.cfg.lock().unwrap().update_mode;
-                    if mode > 0 {
+                    if sh_u.cfg.lock().unwrap().update_mode > 0 {
                         if let Some(rel) = update::fetch_latest() {
                             if version_tuple(&rel.tag) > version_tuple(env!("CARGO_PKG_VERSION")) {
-                                if mode == 2 {
-                                    match update::install(&rel) {
-                                        Ok(()) => {
-                                            logln!("updated to {}", rel.tag);
-                                            set_toast(&sh_u, &format!("Updated to {}. Restart Lumacap to use it", rel.tag));
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            elogln!("auto-update failed: {e}");
-                                            set_toast(&sh_u, &format!("Update {} available, auto-install failed: {e}", rel.tag));
-                                        }
-                                    }
-                                } else {
-                                    set_toast(&sh_u, &format!("Update available: {} (github.com/OhHelioss/lumacap/releases)", rel.tag));
-                                }
+                                set_toast(&sh_u, &format!("Update available: {} (github.com/OhHelioss/lumacap/releases)", rel.tag));
                                 return;
                             }
                         }

@@ -1,13 +1,8 @@
-//! Update checking and optional self-update.
-//! Talks only to api.github.com / github.com (release assets). Auto-install verifies the
-//! SHA-256 digest that GitHub publishes for the release asset before replacing the exe.
-use sha2::{Digest, Sha256};
+//! Update check: asks api.github.com for the latest release tag. Nothing is downloaded or installed.
 use std::ffi::c_void;
 use windows::core::PCWSTR;
 use windows::Win32::Networking::WinHttp::*;
 
-const ASSET_PREFIX: &str = "https://github.com/OhHelioss/lumacap/releases/download/";
-const MAX_EXE: usize = 64 * 1024 * 1024;
 
 pub struct Release {
     pub tag: String,
@@ -98,57 +93,4 @@ pub fn fetch_latest() -> Option<Release> {
         }
     }
     Some(Release { tag, url, sha256 })
-}
-
-fn exe_paths() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
-    let exe = std::env::current_exe().ok()?;
-    let mut old = exe.clone().into_os_string();
-    old.push(".old");
-    let mut new = exe.clone().into_os_string();
-    new.push(".new");
-    Some((exe, old.into(), new.into()))
-}
-
-/// Remove the previous exe left behind by an update (harmless if still locked).
-pub fn cleanup_old() {
-    if let Some((_, old, new)) = exe_paths() {
-        let _ = std::fs::remove_file(old);
-        let _ = std::fs::remove_file(new);
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// Download, verify and swap in the new exe. The running process is not touched.
-pub fn install(rel: &Release) -> Result<(), String> {
-    let url = rel.url.as_deref().ok_or("no download link")?;
-    let want = rel.sha256.as_deref().ok_or("release has no published checksum")?;
-    if want.len() != 64 || !url.starts_with(ASSET_PREFIX) {
-        return Err("unexpected release data".into());
-    }
-    let rest = &url["https://".len()..];
-    let (host, path) = rest.split_at(rest.find('/').ok_or("bad url")?);
-    let data = http_get(host, path, MAX_EXE).ok_or("download failed")?;
-    if data.len() < 500_000 || &data[..2] != b"MZ" {
-        return Err("downloaded file is not a valid exe".into());
-    }
-    let got = hex(&Sha256::digest(&data));
-    if got != want {
-        return Err("checksum mismatch, update discarded".into());
-    }
-    let (exe, old, new) = exe_paths().ok_or("cannot locate exe")?;
-    std::fs::write(&new, &data).map_err(|_| "cannot write next to the exe")?;
-    let _ = std::fs::remove_file(&old);
-    if std::fs::rename(&exe, &old).is_err() {
-        let _ = std::fs::remove_file(&new);
-        return Err("cannot replace the exe".into());
-    }
-    if std::fs::rename(&new, &exe).is_err() {
-        let _ = std::fs::rename(&old, &exe);
-        let _ = std::fs::remove_file(&new);
-        return Err("cannot replace the exe".into());
-    }
-    Ok(())
 }

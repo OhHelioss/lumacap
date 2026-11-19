@@ -47,7 +47,7 @@ Settings > Scene: zoom (100% to 300%) with pan, and a webcam overlay in any corn
 Lumacap talks to the card through the standard Windows capture APIs, so it should work with Elgato's HD60 S, HD60 S+, HD60 X, 4K60 S+, 4K X, Cam Link and similar cards, and many non-Elgato cards. It looks for the card by name and otherwise lets you pick it in Settings > Video > Capture card. Settings > Scene > Capture resolution picks 720p, 1080p, 1440p or 4K when the card offers it. Only the HD60 S has been tested so far. If something looks wrong, attach `%APPDATA%\lumacap\lumacap.log` to an issue.
 
 ## Notes
-- Updates (Settings > System > Updates): **Off**, **Notify only** (default: a toast when a new release exists), or **Auto-install**. Auto-install downloads `lumacap.exe` from this repo's GitHub release, checks it against the SHA-256 GitHub publishes for that file, then swaps it in; restart Lumacap to use the new version. It never touches a running recording or stream. Only github.com is contacted and nothing about you is sent. Note the checksum comes from the same GitHub release, so this protects against corrupted downloads, not a compromised repo; the exe is unsigned. Leave it on Notify if you'd rather update by hand.
+- Update notifications (Settings > System > Notify about updates, on by default): at startup Lumacap asks api.github.com for the latest release tag and shows a toast if a newer one exists. Nothing is downloaded or installed automatically, and nothing about you is sent. Turn it off to never check.
 - Output is MP4 only (Media Foundation has no MKV muxer).
 - HEVC needs a hardware encoder.
 

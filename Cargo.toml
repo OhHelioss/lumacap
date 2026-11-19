@@ -1,6 +1,6 @@
 [package]
 name = "lumacap"
-version = "0.4.7"
+version = "0.4.8"
 description = "Lightweight, open-source capture-card recorder for Windows (Media Foundation, GPU encoding)"
 license = "MIT"
 repository = "https://github.com/OhHelioss/lumacap"
@@ -9,7 +9,6 @@ edition = "2021"
 
 [dependencies]
 png = "0.17"
-sha2 = "0.10"
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
