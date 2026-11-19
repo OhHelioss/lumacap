@@ -31,6 +31,7 @@ struct Params {
     h: u32,
     fps: u32,
     audio_rate: Option<u32>,
+    enc: u32,
 }
 
 fn set_status(ctl: &StreamCtl, s: &str) {
@@ -231,6 +232,7 @@ pub fn go_live() {
         h: sh.fmt.h,
         fps: if half { (sh.fmt.fps / 2).max(1) } else { sh.fmt.fps.max(1) },
         audio_rate,
+        enc: c.stream_enc,
     };
     *sh.stream.lock().unwrap() = Some(ctl.clone());
     set_toast(sh, "Going live…");
@@ -324,11 +326,16 @@ unsafe fn configure_video(act: &IMFActivate, w: u32, h: u32, fps: u32, kbps: u32
     Ok(VEnc { mft, gen, provides: info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0, out_size: info.cbSize })
 }
 
-unsafe fn make_video_encoder(w: u32, h: u32, fps: u32, kbps: u32) -> Result<(VEnc, bool), String> {
+unsafe fn make_video_encoder(w: u32, h: u32, fps: u32, kbps: u32, enc: u32) -> Result<(VEnc, bool), String> {
     let info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
     let mut last = String::from("no H.264 encoder found");
     // Software encoder first: the GPU encoder on some AMD setups writes streams that decoders reject (green picture).
-    for hw in [false, true] {
+    let order: &[bool] = match enc {
+        1 => &[false],
+        2 => &[true],
+        _ => &[false, true],
+    };
+    for &hw in order {
         let flags = if hw { MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER } else { MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER };
         let mut arr: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut n = 0u32;
@@ -511,7 +518,7 @@ fn run_stream(ctl: &Arc<StreamCtl>, rx_v: Receiver<Sendable<IMFSample>>, rx_a: R
 
 impl Run {
     unsafe fn new(p: &Params) -> Result<Run, String> {
-        let (venc, hw) = make_video_encoder(p.w, p.h, p.fps, p.kbps)?;
+        let (venc, hw) = make_video_encoder(p.w, p.h, p.fps, p.kbps, p.enc)?;
         let aenc = match p.audio_rate {
             Some(r) => Some((make_audio_encoder(r)?, r)),
             None => None,

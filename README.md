@@ -15,7 +15,7 @@ A tiny, fast, open-source recorder for capture cards on Windows. One exe, no ins
 - Quality presets (Small / Balanced / High / Max), capture-card picker
 - Low-disk-space warning and auto-stop, optional auto-split of long recordings (15/30/60 min)
 - Minimize to tray and start with Windows
-- Built-in live streaming over RTMP/RTMPS (Twitch, YouTube, Facebook, Kick or any custom server) with the GPU encoder, auto-reconnect and a live bitrate readout, no OBS needed
+- Built-in live streaming over RTMP/RTMPS (Twitch, YouTube, Facebook, Kick or any custom server) with auto-reconnect, a live bitrate readout, one-click Paste buttons for the server address and key, a saved key and bitrate per service, and a choice of software or GPU encoder, no OBS needed
 - Scene tab: digital zoom with pan and a webcam picture-in-picture (experimental)
 - Light/dark theme and accent colours
 
@@ -28,6 +28,14 @@ A tiny, fast, open-source recorder for capture cards on Windows. One exe, no ins
 Both are the same program and share the same settings in `%APPDATA%\lumacap`, so you can switch between them. Uninstalling removes the program but keeps your settings and recordings.
 
 Windows SmartScreen may warn because the files are not code-signed: choose *More info → Run anyway*.
+
+## Streaming to TikTok
+
+1. In TikTok LIVE Studio (or the TikTok app's PC live setup) click **Go LIVE** once so it shows your **Server URL** and **Stream key**.
+2. In Lumacap open Settings > Stream, set Service to **Custom server**, then click **Paste** next to Server address and next to Stream key (copy each from TikTok first).
+3. Click **Go live** in Lumacap. TikTok keys are single-use: get a fresh URL and key for every live, and always use the pair TikTok showed together.
+
+If the picture is green, set **Video encoder** to *Software*.
 
 ## Build it yourself
 

@@ -204,6 +204,9 @@ struct Settings {
     stream_key: String,
     stream_kbps: u32,
     stream_fps30: bool,
+    stream_enc: u32, // 0 auto (software first), 1 software, 2 GPU
+    svc_keys: [String; 4], // saved stream key per service (indexed by service number)
+    svc_kbps: [u32; 4],
     res: u32, // capture resolution: 0 auto (1080p), 1 720p, 2 1440p, 3 2160p
     zoom: u32, // index into scene::ZOOMS
     pan_x: u32,
@@ -257,6 +260,9 @@ impl Settings {
             stream_key: String::new(),
             stream_kbps: 6000,
             stream_fps30: false,
+            stream_enc: 0,
+            svc_keys: Default::default(),
+            svc_kbps: [0; 4],
             res: 0,
             zoom: 0,
             pan_x: 50,
@@ -311,6 +317,15 @@ impl Settings {
                     "stream_key" => s.stream_key = v.to_string(),
                     "stream_kbps" => s.stream_kbps = v.parse().unwrap_or(6000).clamp(1000, 12000),
                     "stream_fps30" => s.stream_fps30 = v == "1",
+                    "stream_enc" => s.stream_enc = v.parse().unwrap_or(0).min(2),
+                    "svc_key0" => s.svc_keys[0] = v.to_string(),
+                    "svc_key1" => s.svc_keys[1] = v.to_string(),
+                    "svc_key2" => s.svc_keys[2] = v.to_string(),
+                    "svc_key3" => s.svc_keys[3] = v.to_string(),
+                    "svc_kbps0" => s.svc_kbps[0] = v.parse().unwrap_or(0),
+                    "svc_kbps1" => s.svc_kbps[1] = v.parse().unwrap_or(0),
+                    "svc_kbps2" => s.svc_kbps[2] = v.parse().unwrap_or(0),
+                    "svc_kbps3" => s.svc_kbps[3] = v.parse().unwrap_or(0),
                     "res" => s.res = v.parse().unwrap_or(0).min(3),
                     "zoom" => s.zoom = v.parse().unwrap_or(0).min(4),
                     "pan_x" => s.pan_x = v.parse().unwrap_or(50).min(100),
@@ -331,7 +346,7 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let txt = format!(
-            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\n",
+            "bitrate={}\nout_dir={}\nshot_dir={}\nvolume={}\nmuted={}\nreplay_on={}\nreplay_secs={}\ntopmost={}\nwin_w={}\nwin_h={}\nhevc={}\nfps30={}\nfmp4={}\ngame_gain={}\nmic_gain={}\nmic_name={}\nmic_separate={}\nclip_beep={}\nlight={}\naccent={}\nhk_rec={}\nhk_shot={}\nhk_replay={}\nhk_pause={}\nsplit_min={}\ntray={}\nautostart={}\nhk_mic={}\nvideo_name={}\nupdate_mode={}\nstream_server={}\nstream_custom={}\nstream_key={}\nstream_kbps={}\nstream_fps30={}\nres={}\nzoom={}\npan_x={}\npan_y={}\ncam_name={}\ncam_pos={}\ncam_size={}\nstream_enc={}\nsvc_key0={}\nsvc_key1={}\nsvc_key2={}\nsvc_key3={}\nsvc_kbps0={}\nsvc_kbps1={}\nsvc_kbps2={}\nsvc_kbps3={}\n",
             self.bitrate,
             self.out_dir,
             self.shot_dir,
@@ -373,7 +388,16 @@ impl Settings {
             self.pan_y,
             self.cam_name,
             self.cam_pos,
-            self.cam_size
+            self.cam_size,
+            self.stream_enc,
+            self.svc_keys[0],
+            self.svc_keys[1],
+            self.svc_keys[2],
+            self.svc_keys[3],
+            self.svc_kbps[0],
+            self.svc_kbps[1],
+            self.svc_kbps[2],
+            self.svc_kbps[3]
         );
         let _ = std::fs::write(p, txt);
     }
@@ -2643,6 +2667,7 @@ enum K {
     Cycle,
     Change,
     Pick,
+    Dual, // two small buttons: Edit / Paste
 }
 
 /// Inline text editing in the Stream tab: (0 = server address, 1 = stream key, text so far).
@@ -2696,7 +2721,7 @@ fn tab_rows(tab: i32) -> &'static [K] {
         0 => &[K::Step, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Pick, K::Change],
         1 => &[K::Step, K::Pick, K::Step, K::Toggle, K::Toggle],
         2 => &[K::Toggle, K::Step, K::Toggle, K::Toggle, K::Cycle, K::Pick, K::Change, K::Change],
-        4 => &[K::Cycle, K::Change, K::Change, K::Step, K::Cycle, K::Toggle, K::Change],
+        4 => &[K::Cycle, K::Dual, K::Dual, K::Step, K::Cycle, K::Toggle, K::Change, K::Cycle],
         5 => &[K::Pick, K::Step, K::Step, K::Pick, K::Cycle, K::Cycle, K::Cycle],
         _ => &[K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Cycle, K::Toggle, K::Toggle, K::Toggle],
     }
@@ -2858,7 +2883,7 @@ unsafe fn apply_topmost(hwnd: HWND, on: bool) {
 // ---------- controls / layout ----------
 
 fn panel_rect(rc: &RECT) -> RECT {
-    let (pw, ph) = (s(620).min(rc.right - 20), s(540).min(rc.bottom - 20));
+    let (pw, ph) = (s(620).min(rc.right - 20), s(if TAB.load(Ordering::Relaxed) == 4 { 600 } else { 540 }).min(rc.bottom - 20));
     let (x, y) = ((rc.right - pw) / 2, (rc.bottom - ph) / 2);
     RECT { left: x, top: y, right: x + pw, bottom: y + ph }
 }
@@ -2920,6 +2945,10 @@ fn controls(rc: &RECT) -> Vec<(i32, RECT)> {
                 K::Toggle => v.push((a, btn(pr.right - s(110), y + s(1), s(70), s(34)))),
                 K::Cycle => v.push((a, btn(pr.right - s(210), y, s(170), s(36)))),
                 K::Change => v.push((a, btn(pr.right - s(150), y, s(110), s(36)))),
+                K::Dual => {
+                    v.push((a, btn(pr.right - s(232), y, s(96), s(36))));
+                    v.push((b, btn(pr.right - s(130), y, s(96), s(36))));
+                }
                 K::Pick => {
                     v.push((a, btn(pr.right - s(350), y, s(40), s(36))));
                     v.push((b, btn(pr.right - s(70), y, s(40), s(36))));
@@ -3203,18 +3232,46 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                 }
                 (4, 0) => {
                     let mut c = sh.cfg.lock().unwrap();
+                    // each service remembers its own key and bitrate
+                    let old = c.stream_server as usize;
+                    let (k, b) = (c.stream_key.clone(), c.stream_kbps);
+                    c.svc_keys[old] = k;
+                    c.svc_kbps[old] = b;
                     c.stream_server = stream::next_service(c.stream_server, which != 0);
+                    let new = c.stream_server as usize;
+                    c.stream_key = c.svc_keys[new].clone();
+                    if c.svc_kbps[new] >= 1000 {
+                        c.stream_kbps = c.svc_kbps[new];
+                    }
                 }
                 (4, 1) => {
                     let custom = stream::is_custom(&sh.cfg.lock().unwrap());
-                    if custom {
+                    if custom && which == 1 {
+                        match clipboard_text() {
+                            Some(t) => {
+                                *EDIT.lock().unwrap() = Some((0, t));
+                                edit_commit(sh);
+                            }
+                            None => set_toast(sh, "The clipboard has no text"),
+                        }
+                    } else if custom {
                         *EDIT.lock().unwrap() = Some((0, String::new()));
                     } else {
                         set_toast(sh, "Set Service to Custom server to type your own address");
                     }
                 }
                 (4, 2) => {
-                    *EDIT.lock().unwrap() = Some((1, String::new()));
+                    if which == 1 {
+                        match clipboard_text() {
+                            Some(t) => {
+                                *EDIT.lock().unwrap() = Some((1, t));
+                                edit_commit(sh);
+                            }
+                            None => set_toast(sh, "The clipboard has no text"),
+                        }
+                    } else {
+                        *EDIT.lock().unwrap() = Some((1, String::new()));
+                    }
                 }
                 (4, 3) => {
                     let mut c = sh.cfg.lock().unwrap();
@@ -3225,6 +3282,10 @@ unsafe fn click(hwnd: HWND, id: i32, x: i32) {
                     c.stream_fps30 = !c.stream_fps30;
                 }
                 (4, 6) => stream::test_connection(),
+                (4, 7) => {
+                    let mut c = sh.cfg.lock().unwrap();
+                    c.stream_enc = (c.stream_enc + 1) % 3;
+                }
                 (5, 0) => {
                     let mut c = sh.cfg.lock().unwrap();
                     c.zoom = if which == 0 { c.zoom.saturating_sub(1) } else { (c.zoom + 1).min(4) };
@@ -4289,20 +4350,29 @@ unsafe fn paint(hwnd: HWND) {
                 let ed = EDIT.lock().unwrap().clone();
                 let caret = if (GetTickCount64() / 500) % 2 == 0 { "|" } else { " " };
                 label(hdc, 1, "Server address", &if let Some((0, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {tx}{caret}") } else if stream::is_custom(&cfg) { if cfg.stream_custom.is_empty() { "Not set. Click Edit and type your rtmp:// or rtmps:// address".to_string() } else { cfg.stream_custom.clone() } } else { stream::server_url(&cfg) });
-                cycle(hdc, 1, if matches!(&ed, Some((0, _))) { "Editing…" } else if stream::is_custom(&cfg) { "Edit" } else { "Preset" });
+                if stream::is_custom(&cfg) {
+                    small_btn(hdc, id_a(1), if matches!(&ed, Some((0, _))) { "Editing…" } else { "Edit" });
+                    small_btn(hdc, id_a(1) + 1, "Paste");
+                } else {
+                    small_btn(hdc, id_a(1), "Preset");
+                }
                 let k = cfg.stream_key.trim();
                 label(hdc, 2, "Stream key", &if let Some((1, tx)) = &ed { format!("Type or Ctrl+V, Enter to save:  {}{caret}  ({} chars)", "•".repeat(tx.chars().count().min(40)), tx.chars().count()) } else if k.is_empty() { "Not set. Click Edit, then paste your key".to_string() } else { format!("Saved: ••••••{}", k.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<String>()) });
-                cycle(hdc, 2, if matches!(&ed, Some((1, _))) { "Editing…" } else { "Edit" });
+                small_btn(hdc, id_a(2), if matches!(&ed, Some((1, _))) { "Editing…" } else { "Edit" });
+                small_btn(hdc, id_a(2) + 1, "Paste");
                 label(hdc, 3, "Stream bitrate", stream::bitrate_hint(&cfg));
                 step(hdc, 3, &format!("{} kbps", cfg.stream_kbps));
                 label(hdc, 4, "Frame rate", "30 fps uses less upload bandwidth");
                 cycle(hdc, 4, if cfg.stream_fps30 { "30 fps" } else { "Source" });
-                label(hdc, 5, "Go live", &if live { stream::status_text().unwrap_or_default() } else { "Streams the capture with the GPU encoder".to_string() });
+                label(hdc, 5, "Go live", &if live { stream::status_text().unwrap_or_default() } else { "Streams what you see in the preview".to_string() });
                 toggle(hdc, 5, live);
                 SelectObject(hdc, f_small);
                 label(hdc, 6, "Test connection", "Connects and disconnects without sending video");
                 cycle(hdc, 6, "Test");
-                let y = panel_row(&pr, 7) + s(2);
+                SelectObject(hdc, f_norm);
+                label(hdc, 7, "Video encoder", match cfg.stream_enc { 1 => "Software only: works everywhere, uses more CPU", 2 => "GPU only: light on the CPU, but some AMD cards give a green picture", _ => "Auto: tries software first, then the GPU" });
+                cycle(hdc, 7, match cfg.stream_enc { 1 => "Software", 2 => "GPU", _ => "Auto" });
+                let y = panel_row(&pr, 8) + s(2);
                 let mut m1 = RECT { left: pr.left + s(28), top: y, right: pr.right - s(28), bottom: y + s(40) };
                 text(hdc, "Your key is stored on this PC only (settings.ini) and is sent to nothing but the server above. Keep it private.", &mut m1, muted_c, DT_LEFT | DT_WORDBREAK);
             }
