@@ -451,6 +451,10 @@ unsafe fn apply_titlebar(hwnd: HWND, light: bool) {
 }
 
 static MON_PLAYING: AtomicBool = AtomicBool::new(false);
+static PRESENTS: AtomicU32 = AtomicU32::new(0);
+static PRESENT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PAINTS: AtomicU32 = AtomicU32::new(0);
+static PV_LOGGED: AtomicU32 = AtomicU32::new(0);
 static LAST_FPS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HK_CAPTURE: AtomicI32 = AtomicI32::new(-1);
 static QUITTING: AtomicBool = AtomicBool::new(false);
@@ -3539,6 +3543,7 @@ unsafe fn fast_present(hwnd: HWND) -> bool {
 }
 
 unsafe fn paint(hwnd: HWND) {
+    PAINTS.fetch_add(1, Ordering::Relaxed);
     let mut ps = PAINTSTRUCT::default();
     let hdc0 = BeginPaint(hwnd, &mut ps);
     let mut rc = RECT::default();
@@ -4379,7 +4384,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let fast_ok = !MOVING.load(Ordering::Relaxed) && fast_present(hwnd);
                     if fast_ok {
                         let took = now_us().saturating_sub(t0);
-                        NEXT_PRESENT_US.store(now_us() + (took * 2).min(100_000), Ordering::Relaxed);
+                        PRESENTS.fetch_add(1, Ordering::Relaxed);
+                        PRESENT_US.fetch_add(took, Ordering::Relaxed);
+                        // Only back off when a present is really slow (input could starve); a normal 3-8 ms draw
+                        // must not cost frames at 60 fps.
+                        if took > 10_000 {
+                            NEXT_PRESENT_US.store(now_us() + took.min(50_000), Ordering::Relaxed);
+                        }
                     } else if paint_allowed() {
                         let _ = InvalidateRect(hwnd, None, false);
                     }
@@ -4399,6 +4410,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let last = sh.last_frames.swap(f, Ordering::Relaxed);
                 let fps = (f.wrapping_sub(last) as u64 * 1000 + since / 2) / since;
                 sh.fps_meas.store(fps.min(u32::MAX as u64) as u32, Ordering::Relaxed);
+                let pres = PRESENTS.swap(0, Ordering::Relaxed) as u64;
+                let pus = PRESENT_US.swap(0, Ordering::Relaxed);
+                let pnt = PAINTS.swap(0, Ordering::Relaxed);
+                let shown = (pres + pnt as u64) * 1000 / since.max(1);
+                if fps >= 25 && shown * 100 < fps * 85 && !HIDDEN.load(Ordering::Relaxed) && PV_LOGGED.load(Ordering::Relaxed) < 30 {
+                    PV_LOGGED.fetch_add(1, Ordering::Relaxed);
+                    logln!(
+                        "preview: capture {} fps, drawn {} /s (fast {} avg {} us, full repaints {}), panel={} full_preview={}",
+                        fps,
+                        shown,
+                        pres,
+                        if pres > 0 { pus / pres } else { 0 },
+                        pnt,
+                        PANEL.load(Ordering::Relaxed),
+                        sh.pv_full.load(Ordering::Relaxed)
+                    );
+                }
                 maintenance();
             }
             // With the fast video path the controls only need ~10 repaints a second unless something is animating.
