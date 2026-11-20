@@ -14,7 +14,7 @@ mod update;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -956,6 +956,10 @@ struct Recorder {
     v_next: AtomicI64,    // timestamp the next frame should get (-1 = not started)
     d_early: AtomicU32,   // frames dropped because they arrived early
     d_nonmono: AtomicU32, // source timestamps that went backwards
+    d_dup: AtomicU32,     // frames whose sampled picture data was identical to the previous frame
+    d_run: AtomicU32,
+    d_maxrun: AtomicU32,
+    d_sig: AtomicU64,
     d_mingap_us: AtomicI64,
     d_frames: AtomicU32,
     d_errs: AtomicU32,
@@ -1086,6 +1090,10 @@ unsafe fn start_recorder(path: &str, f: &VideoFmt, bitrate_bps: u32, afmt: Optio
         v_next: AtomicI64::new(-1),
         d_early: AtomicU32::new(0),
         d_nonmono: AtomicU32::new(0),
+        d_dup: AtomicU32::new(0),
+        d_run: AtomicU32::new(0),
+        d_maxrun: AtomicU32::new(0),
+        d_sig: AtomicU64::new(0),
         d_mingap_us: AtomicI64::new(i64::MAX),
         d_frames: AtomicU32::new(0),
         d_errs: AtomicU32::new(0),
@@ -1114,7 +1122,7 @@ fn finalize_when_free(rec: Arc<Recorder>) -> std::thread::JoinHandle<()> {
             let wall = rec.started.elapsed().as_secs_f64().max(0.001);
             let fr = rec.d_frames.load(Ordering::Relaxed);
             if !rec.path.contains("\\seg_") { logln!(
-                "recording stats: {} frames in {:.1}s wall ({:.1} fps), video ends at {:.1}s, capture gap min {} us / max {} ms, gaps over 50 ms: {}, backwards timestamps: {}, dropped early: {}, slowest WriteSample {} ms, write errors: {}{}, finalize: {:?}",
+                "recording stats: {} frames in {:.1}s wall ({:.1} fps), video ends at {:.1}s, capture gap min {} us / max {} ms, gaps over 50 ms: {}, backwards timestamps: {}, dropped early: {}, identical frames: {} (longest run {}), slowest WriteSample {} ms, write errors: {}{}, finalize: {:?}",
                 fr,
                 wall,
                 fr as f64 / wall,
@@ -1124,6 +1132,8 @@ fn finalize_when_free(rec: Arc<Recorder>) -> std::thread::JoinHandle<()> {
                 rec.d_gaps.load(Ordering::Relaxed),
                 rec.d_nonmono.load(Ordering::Relaxed),
                 rec.d_early.load(Ordering::Relaxed),
+                rec.d_dup.load(Ordering::Relaxed),
+                rec.d_maxrun.load(Ordering::Relaxed),
                 rec.d_maxwrite_us.load(Ordering::Relaxed) / 1000,
                 rec.d_errs.load(Ordering::Relaxed),
                 { let e = rec.d_first_err.lock().unwrap(); if e.is_empty() { String::new() } else { format!(" (first: {})", *e) } },
@@ -1204,6 +1214,41 @@ unsafe fn dup_sample(src: &IMFSample) -> Option<IMFSample> {
     Some(s)
 }
 
+/// Diagnostic: a cheap fingerprint of the picture data, so the log can show whether the capture card really delivers new
+/// pictures (a recording that plays back frozen but has a steady frame count would show a huge "identical frames" count).
+unsafe fn note_frame_content(rec: &Recorder, sample: &IMFSample) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    let Ok(buf) = sample.ConvertToContiguousBuffer() else { return };
+    let mut p: *mut u8 = std::ptr::null_mut();
+    let mut len = 0u32;
+    if buf.Lock(&mut p, None, Some(&mut len)).is_err() {
+        return;
+    }
+    if !p.is_null() && len >= 8192 {
+        let s = std::slice::from_raw_parts(p, len as usize);
+        let step = (len as usize - 8) / 512;
+        let mut h = 0xcbf29ce484222325u64;
+        for i in 0..512 {
+            for &x in &s[i * step..i * step + 8] {
+                h = (h ^ x as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            logln!("capture sample: {} bytes, {} buffer(s)", len, sample.GetBufferCount().unwrap_or(0));
+        }
+        if rec.d_sig.swap(h, Ordering::Relaxed) == h {
+            rec.d_dup.fetch_add(1, Ordering::Relaxed);
+            let r = rec.d_run.fetch_add(1, Ordering::Relaxed) + 1;
+            if r > rec.d_maxrun.load(Ordering::Relaxed) {
+                rec.d_maxrun.store(r, Ordering::Relaxed);
+            }
+        } else {
+            rec.d_run.store(0, Ordering::Relaxed);
+        }
+    }
+    let _ = buf.Unlock();
+}
+
 fn write_video(rec: &Recorder, sample: &IMFSample, ts: i64) {
     unsafe {
         if rec.paused.load(Ordering::Relaxed) {
@@ -1211,6 +1256,9 @@ fn write_video(rec: &Recorder, sample: &IMFSample, ts: i64) {
         }
         if rec.half && rec.fcount.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
             return;
+        }
+        if !rec.path.contains("\\seg_") {
+            note_frame_content(rec, sample);
         }
         let dur = sample.GetSampleDuration().unwrap_or(166_666);
         if rec.base.load(Ordering::SeqCst) == NO_BASE {
